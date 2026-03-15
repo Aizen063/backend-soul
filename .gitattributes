@@ -1,0 +1,6 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Keep these files with LF endings
+.gitattributes text eol=lf
+.gitignore text eol=lf
