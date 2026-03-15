@@ -1,9 +1,21 @@
-const path = require('path');
 const Artist = require('../models/Artist');
 const Song = require('../models/Song');
+const cloudinary = require('../config/cloudinary');
 
 // Helper to build file URL
 const buildFileUrl = (req, file) => file.path;
+
+/**
+ * Delete an asset from Cloudinary if it's a Cloudinary URL.
+ */
+const deleteAsset = async (url) => {
+    if (!url || !url.includes('res.cloudinary.com')) return;
+    try {
+        const match = url.match(/\/upload\/(?:v\d+\/)?(.+)\.[^.]+$/);
+        if (!match) return;
+        await cloudinary.uploader.destroy(match[1], { resource_type: 'image', invalidate: true });
+    } catch { /* ignore cleanup errors */ }
+};
 
 /**
  * @desc    Create a new artist (Admin only)
@@ -104,7 +116,10 @@ const updateArtist = async (req, res) => {
     if (name) artist.name = name;
     if (bio !== undefined) artist.bio = bio;
     if (genre !== undefined) artist.genre = genre;
-    if (req.file) artist.photo = buildFileUrl(req, req.file);
+    if (req.file) {
+        await deleteAsset(artist.photo); // remove old photo from Cloudinary
+        artist.photo = buildFileUrl(req, req.file);
+    }
 
     await artist.save();
 
@@ -135,6 +150,7 @@ const deleteArtist = async (req, res) => {
         });
     }
 
+    await deleteAsset(artist.photo); // remove photo from Cloudinary
     await artist.deleteOne();
     return res.status(200).json({ success: true, message: 'Artist deleted successfully.' });
 };

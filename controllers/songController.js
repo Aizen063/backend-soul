@@ -4,23 +4,31 @@ const mongoose = require('mongoose');
 const Song = require('../models/Song');
 const Artist = require('../models/Artist');
 const User = require('../models/User');
+const cloudinary = require('../config/cloudinary');
 
 const buildFileUrl = (req, file) => {
     return file.path; // For Cloudinary, file.path is the full asset URL
 };
 
 /**
- * Helper: delete a file from the uploads directory using its stored URL
- * Note: Cloudinary asset deletion is omitted here for simplicity,
- * but handles local fallback cleanup safely.
+ * Delete an asset — from Cloudinary if it's a Cloudinary URL, otherwise from local disk.
  */
-const deleteUploadedFile = (url) => {
+const deleteAsset = async (url) => {
     if (!url) return;
+    if (url.includes('res.cloudinary.com')) {
+        try {
+            // Extract public_id: everything between '/upload/[v123/]' and the file extension
+            const match = url.match(/\/upload\/(?:v\d+\/)?(.+)\.[^.]+$/);
+            if (!match) return;
+            const publicId = match[1];
+            // Cloudinary stores audio as 'video' resource type
+            const resourceType = url.includes('/video/') ? 'video' : 'image';
+            await cloudinary.uploader.destroy(publicId, { resource_type: resourceType, invalidate: true });
+        } catch { /* ignore cleanup errors */ }
+        return;
+    }
+    // Local fallback
     try {
-        if (url.includes('cloudinary.com')) {
-           // Skip local deletion for cloudinary URLs
-           return;
-        }
         const filename = url.split('/uploads/').pop();
         if (!filename) return;
         const filePath = path.join(__dirname, '..', 'uploads', filename);
@@ -224,11 +232,11 @@ const updateSong = async (req, res) => {
     }
 
     if (req.files && req.files['audio']) {
-        deleteUploadedFile(song.audioUrl); // clean up old file
+        await deleteAsset(song.audioUrl); // clean up old asset
         song.audioUrl = buildFileUrl(req, req.files['audio'][0]);
     }
     if (req.files && req.files['coverImage']) {
-        deleteUploadedFile(song.coverImage); // clean up old file
+        await deleteAsset(song.coverImage); // clean up old asset
         song.coverImage = buildFileUrl(req, req.files['coverImage'][0]);
     }
 
@@ -253,9 +261,8 @@ const deleteSong = async (req, res) => {
         return res.status(404).json({ success: false, message: 'Song not found.' });
     }
 
-    // Clean up associated files from disk
-    deleteUploadedFile(song.audioUrl);
-    deleteUploadedFile(song.coverImage);
+    // Delete associated assets from Cloudinary (or local disk)
+    await Promise.all([deleteAsset(song.audioUrl), deleteAsset(song.coverImage)]);
 
     // Remove from all users' likedSongs arrays
     await User.updateMany(
@@ -353,11 +360,10 @@ const bulkDeleteSongs = async (req, res) => {
 
     const songs = await Song.find({ _id: { $in: ids } });
 
-    // Delete associated files from disk
-    for (const song of songs) {
-        deleteUploadedFile(song.audioUrl);
-        deleteUploadedFile(song.coverImage);
-    }
+    // Delete associated assets from Cloudinary (or local disk)
+    await Promise.all(
+        songs.flatMap(song => [deleteAsset(song.audioUrl), deleteAsset(song.coverImage)])
+    );
 
     // Remove from all users' likedSongs
     await User.updateMany(
