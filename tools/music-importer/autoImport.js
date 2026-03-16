@@ -4,13 +4,11 @@
  *
  * Usage:
  *   node tools/music-importer/autoImport.js "PLAYLIST_URL" [--token JWT] [--api http://localhost:5000]
+ *   node tools/music-importer/autoImport.js --api https://backend-soul.onrender.com "PLAYLIST_URL"
  *
  * Or via npm (from /backend):
  *   npm run import-music -- "PLAYLIST_URL"
- *
- * Prerequisites (external):
- *   - yt-dlp  must be installed and in PATH  → https://github.com/yt-dlp/yt-dlp
- *   - ffmpeg  must be installed and in PATH  → https://ffmpeg.org/download.html
+ *   npm run import-live -- "PLAYLIST_URL"
  *
  * Auth:
  *   Pass --token <JWT>  OR set IMPORT_TOKEN in .env
@@ -29,16 +27,29 @@ const sharp = require('sharp');
 
 // ─── Parse args ──────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
-if (!args[0] || args[0].startsWith('--')) {
+const getArg = (flag, fallback = '') => {
+    const index = args.indexOf(flag);
+    return index !== -1 && args[index + 1] ? args[index + 1] : fallback;
+};
+
+const flagsWithValues = new Set(['--token', '--api']);
+const positionalArgs = [];
+
+for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg.startsWith('--')) {
+        if (flagsWithValues.has(arg)) index++;
+        continue;
+    }
+    positionalArgs.push(arg);
+}
+
+if (!positionalArgs[0]) {
     console.error('Usage: node autoImport.js "PLAYLIST_URL" [--token JWT] [--api URL]');
     process.exit(1);
 }
 
-const PLAYLIST_URL = args[0];
-const getArg = (flag, fallback = '') => {
-    const i = args.indexOf(flag);
-    return i !== -1 && args[i + 1] ? args[i + 1] : fallback;
-};
+const PLAYLIST_URL = positionalArgs[0];
 
 require('dotenv').config({ path: path.join(__dirname, '../../.env') });
 

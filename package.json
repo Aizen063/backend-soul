@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
-    "import-music": "node tools/music-importer/autoImport.js"
+    "import-music": "node tools/music-importer/autoImport.js",
+    "import-live": "node tools/music-importer/autoImport.js --api https://backend-soul.onrender.com"
   },
   "keywords": [],
   "author": "",
