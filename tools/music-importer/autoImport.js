@@ -24,9 +24,8 @@ const os = require('os');
 const fs = require('fs-extra');
 const axios = require('axios');
 const FormData = require('form-data');
+const play = require('play-dl');
 const sharp = require('sharp');
-const ytDlpExec = require('yt-dlp-exec');
-const { execSync } = require('child_process');
 
 // ─── Parse args ──────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
@@ -73,14 +72,19 @@ function safeStem(str) {
 }
 
 /**
- * Extract title + artist from yt-dlp info dict.
- * Priority: embedded metadata → "Artist - Title" parsing → channel name → fallback.
+ * Extract title + artist from YouTube metadata.
+ * Priority: music metadata → title parsing → channel name → fallback.
  */
 function extractMeta(info) {
     let title = (info.title || '').trim();
-    // yt-dlp provides artist info in various fields depending on the source
+    const channelName = info.channel?.name || info.channel || info.uploader || '';
+    const musicMeta = Array.isArray(info.music) ? info.music : [];
+    const musicArtist = musicMeta.find((item) => /artist/i.test(item.song || '') || /artist/i.test(item.category || '') || /artist/i.test(item.url || ''));
+    const directMusicArtist = musicMeta.find((item) => item.artist)?.artist;
     let artist = (
         info.artist ||
+        directMusicArtist ||
+        musicArtist?.artist ||
         info.creator ||
         (Array.isArray(info.creators) ? info.creators[0] : '') ||
         info.album_artist ||
@@ -114,7 +118,7 @@ function extractMeta(info) {
 
     // If still no artist, try the uploader/channel (often is the artist on music channels)
     if (!artist) {
-        const uploader = (info.uploader || info.channel || '').trim();
+        const uploader = channelName.trim();
         // Skip generic uploader names
         const generic = ['vevo', 'topic', 'records', 'music', 'official'];
         if (uploader && !generic.some(g => uploader.toLowerCase().includes(g) && uploader.length < 20)) {
@@ -193,47 +197,76 @@ async function convertToJpg(inputPath, outputPath) {
         .toFile(outputPath);
 }
 
-// ─── Find thumbnail file left by yt-dlp ──────────────────────────────────────
-function findThumbnail(stem, searchDir) {
-    const exts = ['.jpg', '.jpeg', '.png', '.webp', '.JPG', '.JPEG', '.PNG', '.WEBP'];
-    for (const ext of exts) {
-        const candidate = path.join(searchDir, stem + ext);
-        if (fs.existsSync(candidate)) return candidate;
-    }
-    // yt-dlp sometimes uses a slightly different stem
-    try {
-        const all = fs.readdirSync(searchDir);
-        const match = all.find(f => f.startsWith(stem) && exts.some(e => f.endsWith(e)));
-        if (match) return path.join(searchDir, match);
-    } catch (_) { }
-    return null;
+async function downloadThumbnailToJpg(url, outputPath) {
+    const response = await axios.get(url, { responseType: 'arraybuffer', timeout: 30000 });
+    await sharp(response.data)
+        .jpeg({ quality: 90 })
+        .toFile(outputPath);
 }
 
-// ─── Download one entry via yt-dlp ───────────────────────────────────────────
-async function downloadEntry(url, outputTemplate) {
-    await ytDlpExec(url, {
-        extractAudio: true,
-        audioFormat: 'mp3',
-        audioQuality: 0,
-        writeThumbnail: true,
-        embedMetadata: true,
-        noPlaylist: true,
-        output: outputTemplate,
-        ffmpegLocation: 'ffmpeg', // assumes ffmpeg in PATH
+const extensionFromMimeType = (mimeType = '') => {
+    const normalized = mimeType.toLowerCase();
+    if (normalized.includes('audio/webm')) return 'webm';
+    if (normalized.includes('audio/mp4')) return 'm4a';
+    if (normalized.includes('audio/mpeg')) return 'mp3';
+    if (normalized.includes('audio/ogg')) return 'ogg';
+    return 'bin';
+};
+
+async function streamToFile(sourceStream, filePath) {
+    await fs.ensureDir(path.dirname(filePath));
+    await new Promise((resolve, reject) => {
+        const writer = fs.createWriteStream(filePath);
+        sourceStream.pipe(writer);
+        sourceStream.on('error', reject);
+        writer.on('error', reject);
+        writer.on('finish', resolve);
     });
+}
+
+async function downloadEntry(url, stem) {
+    const info = await play.video_info(url);
+    const audioFormats = (info.format || [])
+        .filter((format) => typeof format.mimeType === 'string' && format.mimeType.startsWith('audio/') && format.url)
+        .sort((left, right) => (Number(right.bitrate || right.averageBitrate || 0) - Number(left.bitrate || left.averageBitrate || 0)));
+
+    if (!audioFormats.length) {
+        throw new Error('No downloadable audio stream found for this video.');
+    }
+
+    const selectedFormat = audioFormats[0];
+    const audioExt = extensionFromMimeType(selectedFormat.mimeType);
+    const audioPath = path.join(SONGS_DIR, `${stem}.${audioExt}`);
+
+    const audioResponse = await axios.get(selectedFormat.url, {
+        responseType: 'stream',
+        timeout: 120000,
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+    });
+    await streamToFile(audioResponse.data, audioPath);
+
+    const thumbnailUrl = info.video_details?.thumbnails?.at(-1)?.url;
+    const jpgPath = path.join(COVERS_DIR, `${stem}.jpg`);
+    let hasCover = false;
+
+    if (thumbnailUrl) {
+        try {
+            await downloadThumbnailToJpg(thumbnailUrl, jpgPath);
+            hasCover = true;
+        } catch (thumbnailError) {
+            warn(`Cover download failed: ${thumbnailError.message}`);
+        }
+    }
+
+    return { info, audioPath, audioExt, jpgPath, hasCover };
 }
 
 // ─── Get flat playlist info ───────────────────────────────────────────────────
 async function getPlaylistEntries(playlistUrl) {
     log('Fetching playlist info (this may take a moment)…');
-    const info = await ytDlpExec(playlistUrl, {
-        flatPlaylist: true,
-        dumpSingleJson: true,
-        skipDownload: true,
-        quiet: true,
-    });
-
-    const entries = (info.entries || [info]).filter(Boolean);
+    const playlist = await play.playlist_info(playlistUrl, { incomplete: true });
+    const entries = await playlist.all_videos();
     log(`Found ${entries.length} track(s) in playlist.`);
     return entries;
 }
@@ -265,7 +298,7 @@ async function main() {
 
     for (let i = 0; i < entries.length; i++) {
         const entry = entries[i];
-        const videoUrl = entry.url || entry.webpage_url || PLAYLIST_URL;
+        const videoUrl = entry.url || entry.webpage_url || `https://www.youtube.com/watch?v=${entry.id}` || PLAYLIST_URL;
         const rawTitle = entry.title || `Track ${i + 1}`;
 
         console.log(`\n─── [${i + 1}/${entries.length}] ${rawTitle} ───`);
@@ -293,63 +326,56 @@ async function main() {
         const stem = (artist && artist !== 'Unknown Artist')
             ? `${artistStem}---${titleStem}`
             : titleStem;
-        const mp3Path = path.join(SONGS_DIR, `${stem}.mp3`);
-        const jpgPath = path.join(COVERS_DIR, `${stem}.jpg`);
-        const dlTemplate = path.join(SONGS_DIR, `${stem}.%(ext)s`);
-
         log(`Downloading: ${title}`);
+        let downloadResult;
         try {
-            await downloadEntry(videoUrl, dlTemplate);
+            downloadResult = await downloadEntry(videoUrl, stem);
         } catch (e) {
             err(`Download failed: ${e.message}`);
             summary.failed++;
             continue;
         }
 
-        // Verify mp3 exists
-        if (!fs.existsSync(mp3Path)) {
-            // yt-dlp may have written a slightly different path when the stem had special chars
-            err(`MP3 not found at expected path: ${mp3Path}`);
+        const { info, audioPath, audioExt, jpgPath, hasCover } = downloadResult;
+
+        if (!fs.existsSync(audioPath)) {
+            err(`Audio not found at expected path: ${audioPath}`);
             summary.failed++;
             continue;
         }
 
-        // ── Step 4: convert thumbnail → JPG ───────────────────────────────
-        log('Converting thumbnail…');
-        const thumbSrc = findThumbnail(stem, SONGS_DIR);
-        let hasCover = false;
-        if (thumbSrc) {
-            try {
-                await convertToJpg(thumbSrc, jpgPath);
-                // Remove original thumbnail from songs dir
-                if (thumbSrc !== jpgPath) fs.removeSync(thumbSrc);
-                hasCover = true;
-                ok(`Cover saved: ${path.basename(jpgPath)}`);
-            } catch (e) {
-                warn(`Cover conversion failed: ${e.message} — uploading without cover`);
-            }
-        } else {
-            warn('No thumbnail found — uploading without cover');
+        const refreshedMeta = extractMeta(info.video_details || entry);
+        if (refreshedMeta.title && refreshedMeta.title !== title) {
+            log(`Resolved title: ${refreshedMeta.title}`);
+        }
+        if (refreshedMeta.artist && refreshedMeta.artist !== artist) {
+            log(`Resolved artist: ${refreshedMeta.artist}`);
         }
 
-        // ── Step 5: find / create artist in DB ────────────────────────────
+        if (!hasCover) {
+            warn('No thumbnail found — uploading without cover');
+        } else {
+            ok(`Cover saved: ${path.basename(jpgPath)}`);
+        }
+
+        // ── Step 4: find / create artist in DB ────────────────────────────
         log('Resolving artist…');
         let artistId;
         try {
-            artistId = await getOrCreateArtist(artist, token);
+            artistId = await getOrCreateArtist(refreshedMeta.artist || artist, token);
         } catch (e) {
             err(`Artist lookup/creation failed: ${e.message}`);
             summary.failed++;
             continue;
         }
 
-        // ── Step 6: upload ─────────────────────────────────────────────────
+        // ── Step 5: upload ─────────────────────────────────────────────────
         log('Uploading to API…');
         try {
             const form = new FormData();
-            form.append('title', title);
+            form.append('title', refreshedMeta.title || title);
             form.append('artistId', artistId);
-            form.append('audio', fs.createReadStream(mp3Path), `${stem}.mp3`);
+            form.append('audio', fs.createReadStream(audioPath), `${stem}.${audioExt}`);
             if (hasCover && fs.existsSync(jpgPath)) {
                 form.append('coverImage', fs.createReadStream(jpgPath), `${stem}.jpg`);
             }
@@ -363,9 +389,9 @@ async function main() {
                 maxBodyLength: Infinity,
             });
 
-            ok(`Saved: "${title}" by ${artist}`);
+            ok(`Saved: "${refreshedMeta.title || title}" by ${refreshedMeta.artist || artist}`);
             // Mark as known to avoid re-uploading if script crashes and is re-run
-            _existingTitles?.add(title.toLowerCase().trim());
+            _existingTitles?.add((refreshedMeta.title || title).toLowerCase().trim());
             summary.success++;
         } catch (e) {
             err(`Upload failed: ${e.response?.data?.message || e.message}`);
