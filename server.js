@@ -33,7 +33,7 @@ app.use(
     })
 );
 app.use(cors({
-    origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
+    origin: process.env.CORS_ORIGIN || 'https://backend-soul.vercel.app',
     credentials: true,
 }));
 app.use(morgan(process.env.NODE_ENV === 'development' ? 'dev' : 'combined'));
