@@ -25,6 +25,15 @@ const FormData = require('form-data');
 const play = require('play-dl');
 const sharp = require('sharp');
 
+const importEnvPath = path.join(__dirname, '../../.env.import');
+const defaultEnvPath = path.join(__dirname, '../../.env');
+
+if (fs.existsSync(importEnvPath)) {
+    require('dotenv').config({ path: importEnvPath });
+} else {
+    require('dotenv').config({ path: defaultEnvPath });
+}
+
 // ─── Parse args ──────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
 const getArg = (flag, fallback = '') => {
@@ -50,8 +59,6 @@ if (!positionalArgs[0]) {
 }
 
 const PLAYLIST_URL = positionalArgs[0];
-
-require('dotenv').config({ path: path.join(__dirname, '../../.env') });
 
 const API_BASE = getArg('--api', process.env.API_BASE || 'http://localhost:5000');
 const TOKEN_ARG = getArg('--token', process.env.IMPORT_TOKEN || '');
@@ -277,6 +284,14 @@ const extensionFromMimeType = (mimeType = '') => {
     return 'bin';
 };
 
+const extensionFromStreamType = (streamType = '') => {
+    const normalized = String(streamType).toLowerCase();
+    if (normalized.includes('webm')) return 'webm';
+    if (normalized.includes('ogg')) return 'ogg';
+    if (normalized.includes('opus')) return 'webm';
+    return 'm4a';
+};
+
 async function streamToFile(sourceStream, filePath) {
     await fs.ensureDir(path.dirname(filePath));
     await new Promise((resolve, reject) => {
@@ -289,26 +304,33 @@ async function streamToFile(sourceStream, filePath) {
 }
 
 async function downloadEntry(url, stem) {
-    const info = await play.video_info(url);
+    const normalizedUrl = normalizeVideoUrl(url);
+    const info = await play.video_info(normalizedUrl);
     const audioFormats = (info.format || [])
         .filter((format) => typeof format.mimeType === 'string' && format.mimeType.startsWith('audio/') && format.url)
         .sort((left, right) => (Number(right.bitrate || right.averageBitrate || 0) - Number(left.bitrate || left.averageBitrate || 0)));
 
-    if (!audioFormats.length) {
-        throw new Error('No downloadable audio stream found for this video.');
+    let audioExt;
+    let audioPath;
+
+    if (audioFormats.length) {
+        const selectedFormat = audioFormats[0];
+        audioExt = extensionFromMimeType(selectedFormat.mimeType);
+        audioPath = path.join(SONGS_DIR, `${stem}.${audioExt}`);
+
+        const audioResponse = await axios.get(selectedFormat.url, {
+            responseType: 'stream',
+            timeout: 120000,
+            maxBodyLength: Infinity,
+            maxContentLength: Infinity,
+        });
+        await streamToFile(audioResponse.data, audioPath);
+    } else {
+        const streamedAudio = await play.stream(normalizedUrl, { quality: 2 });
+        audioExt = extensionFromStreamType(streamedAudio.type);
+        audioPath = path.join(SONGS_DIR, `${stem}.${audioExt}`);
+        await streamToFile(streamedAudio.stream, audioPath);
     }
-
-    const selectedFormat = audioFormats[0];
-    const audioExt = extensionFromMimeType(selectedFormat.mimeType);
-    const audioPath = path.join(SONGS_DIR, `${stem}.${audioExt}`);
-
-    const audioResponse = await axios.get(selectedFormat.url, {
-        responseType: 'stream',
-        timeout: 120000,
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
-    });
-    await streamToFile(audioResponse.data, audioPath);
 
     const thumbnailUrl = info.video_details?.thumbnails?.at(-1)?.url;
     const jpgPath = path.join(COVERS_DIR, `${stem}.jpg`);
