@@ -1,4 +1,5 @@
 const path = require('path');
+const fs = require('fs');
 const { spawn } = require('child_process');
 
 /**
@@ -8,6 +9,20 @@ const { spawn } = require('child_process');
 const jobs = {};
 
 let jobCounter = 0;
+
+const resolveImporterScriptPath = () => {
+    const candidates = [
+        path.join(__dirname, '../tools/music-importer/autoImport.js'),
+        path.join(__dirname, '../../tools/music-importer/autoImport.js'),
+    ];
+    return candidates.find((p) => fs.existsSync(p)) || null;
+};
+
+const getImporterBaseDir = () => {
+    const scriptPath = resolveImporterScriptPath();
+    if (!scriptPath) return null;
+    return path.dirname(scriptPath);
+};
 
 /**
  * @desc  Start a playlist import job
@@ -27,14 +42,20 @@ const startImport = (req, res) => {
     const authHeader = req.headers['authorization'] || '';
     const token = authHeader.replace(/^Bearer\s+/i, '').trim();
 
-    const scriptPath = path.join(__dirname, '../../tools/music-importer/autoImport.js');
+    const scriptPath = resolveImporterScriptPath();
+    if (!scriptPath) {
+        return res.status(500).json({
+            success: false,
+            message: 'Importer script not found in deployment. Ensure tools/music-importer/autoImport.js is included in backend build output.',
+        });
+    }
 
     // Spawn as a child process so the response returns immediately
     const child = spawn(
         process.execPath, // same node binary
         [scriptPath, playlistUrl, '--token', token, '--api', `http://localhost:${process.env.PORT || 5000}`],
         {
-            cwd: path.join(__dirname, '../..'),
+            cwd: path.join(__dirname, '..'),
             env: { ...process.env },
         }
     );
@@ -90,9 +111,12 @@ const listImports = (req, res) => {
  * @route GET /api/admin/import/downloads
  */
 const listDownloads = (req, res) => {
-    const fs = require('fs');
-    const songsDir = path.join(__dirname, '../../tools/music-importer/downloads/songs');
-    const coversDir = path.join(__dirname, '../../tools/music-importer/downloads/covers');
+    const importerBaseDir = getImporterBaseDir();
+    if (!importerBaseDir) {
+        return res.json({ success: true, data: [] });
+    }
+    const songsDir = path.join(importerBaseDir, 'downloads/songs');
+    const coversDir = path.join(importerBaseDir, 'downloads/covers');
 
     if (!fs.existsSync(songsDir)) {
         return res.json({ success: true, data: [] });
@@ -176,10 +200,13 @@ const listDownloads = (req, res) => {
  * @route DELETE /api/admin/import/downloads
  */
 const clearDownloads = (req, res) => {
-    const fs = require('fs');
+    const importerBaseDir = getImporterBaseDir();
+    if (!importerBaseDir) {
+        return res.json({ success: true, message: 'Importer directory not found.', deleted: 0 });
+    }
     const dirs = [
-        path.join(__dirname, '../../tools/music-importer/downloads/songs'),
-        path.join(__dirname, '../../tools/music-importer/downloads/covers'),
+        path.join(importerBaseDir, 'downloads/songs'),
+        path.join(importerBaseDir, 'downloads/covers'),
     ];
 
     let deleted = 0;
@@ -221,7 +248,6 @@ const ffmpegConvertToMp3 = (inputPath, outputPath) => {
  * @body  { songs: [{ filename, coverFile, title, artistId, album, genre }] }
  */
 const uploadDownloads = async (req, res) => {
-    const fs = require('fs');
     const os = require('os');
     const FormData = require('form-data');
     const axios = require('axios');
@@ -231,8 +257,13 @@ const uploadDownloads = async (req, res) => {
         return res.status(400).json({ success: false, message: 'songs array is required' });
     }
 
-    const songsDir = path.join(__dirname, '../../tools/music-importer/downloads/songs');
-    const coversDir = path.join(__dirname, '../../tools/music-importer/downloads/covers');
+    const importerBaseDir = getImporterBaseDir();
+    if (!importerBaseDir) {
+        return res.status(500).json({ success: false, message: 'Importer directory not found in deployment.' });
+    }
+
+    const songsDir = path.join(importerBaseDir, 'downloads/songs');
+    const coversDir = path.join(importerBaseDir, 'downloads/covers');
 
     const authHeader = req.headers['authorization'] || '';
     const token = authHeader.replace(/^Bearer\s+/i, '').trim();
