@@ -71,6 +71,28 @@ function safeStem(str) {
         .slice(0, 80);
 }
 
+function normalizePlaylistUrl(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== 'string') {
+        throw new Error('Playlist URL is required.');
+    }
+
+    const input = rawUrl.trim();
+
+    // Accept raw playlist IDs as well.
+    if (!input.startsWith('http://') && !input.startsWith('https://')) {
+        return `https://www.youtube.com/playlist?list=${input}`;
+    }
+
+    const parsed = new URL(input);
+    const listId = parsed.searchParams.get('list');
+
+    if (listId) {
+        return `https://www.youtube.com/playlist?list=${listId}`;
+    }
+
+    return input;
+}
+
 /**
  * Extract title + artist from YouTube metadata.
  * Priority: music metadata → title parsing → channel name → fallback.
@@ -265,7 +287,8 @@ async function downloadEntry(url, stem) {
 // ─── Get flat playlist info ───────────────────────────────────────────────────
 async function getPlaylistEntries(playlistUrl) {
     log('Fetching playlist info (this may take a moment)…');
-    const playlist = await play.playlist_info(playlistUrl, { incomplete: true });
+    const normalizedPlaylistUrl = normalizePlaylistUrl(playlistUrl);
+    const playlist = await play.playlist_info(normalizedPlaylistUrl, { incomplete: true });
     const entries = await playlist.all_videos();
     log(`Found ${entries.length} track(s) in playlist.`);
     return entries;
