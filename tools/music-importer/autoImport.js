@@ -93,6 +93,33 @@ function normalizePlaylistUrl(rawUrl) {
     return input;
 }
 
+function normalizeVideoUrl(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== 'string') {
+        throw new Error('Video URL is required.');
+    }
+
+    const input = rawUrl.trim();
+    if (!input.startsWith('http://') && !input.startsWith('https://')) {
+        return `https://www.youtube.com/watch?v=${input}`;
+    }
+
+    const parsed = new URL(input);
+
+    if (parsed.hostname === 'youtu.be') {
+        const videoId = parsed.pathname.replace(/^\//, '').trim();
+        if (videoId) {
+            return `https://www.youtube.com/watch?v=${videoId}`;
+        }
+    }
+
+    const videoId = parsed.searchParams.get('v');
+    if (videoId) {
+        return `https://www.youtube.com/watch?v=${videoId}`;
+    }
+
+    return input;
+}
+
 /**
  * Extract title + artist from YouTube metadata.
  * Priority: music metadata → title parsing → channel name → fallback.
@@ -287,11 +314,18 @@ async function downloadEntry(url, stem) {
 // ─── Get flat playlist info ───────────────────────────────────────────────────
 async function getPlaylistEntries(playlistUrl) {
     log('Fetching playlist info (this may take a moment)…');
-    const normalizedPlaylistUrl = normalizePlaylistUrl(playlistUrl);
-    const playlist = await play.playlist_info(normalizedPlaylistUrl, { incomplete: true });
-    const entries = await playlist.all_videos();
-    log(`Found ${entries.length} track(s) in playlist.`);
-    return entries;
+    try {
+        const normalizedPlaylistUrl = normalizePlaylistUrl(playlistUrl);
+        const playlist = await play.playlist_info(normalizedPlaylistUrl, { incomplete: true });
+        const entries = await playlist.all_videos();
+        log(`Found ${entries.length} track(s) in playlist.`);
+        return entries;
+    } catch (playlistError) {
+        const normalizedVideoUrl = normalizeVideoUrl(playlistUrl);
+        const videoInfo = await play.video_basic_info(normalizedVideoUrl);
+        log('Input is not a playlist. Falling back to single-video import.');
+        return [videoInfo.video_details];
+    }
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
