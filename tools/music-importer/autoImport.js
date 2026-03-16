@@ -20,6 +20,7 @@
 'use strict';
 
 const path = require('path');
+const os = require('os');
 const fs = require('fs-extra');
 const axios = require('axios');
 const FormData = require('form-data');
@@ -46,7 +47,10 @@ const API_BASE = getArg('--api', process.env.API_BASE || 'http://localhost:5000'
 const TOKEN_ARG = getArg('--token', process.env.IMPORT_TOKEN || '');
 
 // ─── Dirs ─────────────────────────────────────────────────────────────────────
-const DOWNLOAD_DIR = path.join(__dirname, 'downloads');
+const DOWNLOAD_DIR = process.env.IMPORT_DOWNLOAD_DIR
+    || (process.env.VERCEL
+        ? path.join(os.tmpdir(), 'soul-sound-importer', 'downloads')
+        : path.join(__dirname, 'downloads'));
 const SONGS_DIR = path.join(DOWNLOAD_DIR, 'songs');
 const COVERS_DIR = path.join(DOWNLOAD_DIR, 'covers');
 

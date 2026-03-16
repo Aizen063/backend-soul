@@ -1,5 +1,6 @@
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { spawn } = require('child_process');
 
 /**
@@ -22,6 +23,14 @@ const getImporterBaseDir = () => {
     const scriptPath = resolveImporterScriptPath();
     if (!scriptPath) return null;
     return path.dirname(scriptPath);
+};
+
+const getImporterDownloadsDir = () => {
+    if (process.env.IMPORT_DOWNLOAD_DIR) return process.env.IMPORT_DOWNLOAD_DIR;
+    if (process.env.VERCEL) return path.join(os.tmpdir(), 'soul-sound-importer', 'downloads');
+    const importerBaseDir = getImporterBaseDir();
+    if (!importerBaseDir) return null;
+    return path.join(importerBaseDir, 'downloads');
 };
 
 /**
@@ -56,7 +65,10 @@ const startImport = (req, res) => {
         [scriptPath, playlistUrl, '--token', token, '--api', `http://localhost:${process.env.PORT || 5000}`],
         {
             cwd: path.join(__dirname, '..'),
-            env: { ...process.env },
+            env: {
+                ...process.env,
+                IMPORT_DOWNLOAD_DIR: process.env.IMPORT_DOWNLOAD_DIR || path.join(os.tmpdir(), 'soul-sound-importer', 'downloads'),
+            },
         }
     );
 
@@ -111,12 +123,12 @@ const listImports = (req, res) => {
  * @route GET /api/admin/import/downloads
  */
 const listDownloads = (req, res) => {
-    const importerBaseDir = getImporterBaseDir();
-    if (!importerBaseDir) {
+    const downloadsDir = getImporterDownloadsDir();
+    if (!downloadsDir) {
         return res.json({ success: true, data: [] });
     }
-    const songsDir = path.join(importerBaseDir, 'downloads/songs');
-    const coversDir = path.join(importerBaseDir, 'downloads/covers');
+    const songsDir = path.join(downloadsDir, 'songs');
+    const coversDir = path.join(downloadsDir, 'covers');
 
     if (!fs.existsSync(songsDir)) {
         return res.json({ success: true, data: [] });
@@ -200,13 +212,13 @@ const listDownloads = (req, res) => {
  * @route DELETE /api/admin/import/downloads
  */
 const clearDownloads = (req, res) => {
-    const importerBaseDir = getImporterBaseDir();
-    if (!importerBaseDir) {
+    const downloadsDir = getImporterDownloadsDir();
+    if (!downloadsDir) {
         return res.json({ success: true, message: 'Importer directory not found.', deleted: 0 });
     }
     const dirs = [
-        path.join(importerBaseDir, 'downloads/songs'),
-        path.join(importerBaseDir, 'downloads/covers'),
+        path.join(downloadsDir, 'songs'),
+        path.join(downloadsDir, 'covers'),
     ];
 
     let deleted = 0;
@@ -257,13 +269,13 @@ const uploadDownloads = async (req, res) => {
         return res.status(400).json({ success: false, message: 'songs array is required' });
     }
 
-    const importerBaseDir = getImporterBaseDir();
-    if (!importerBaseDir) {
+    const downloadsDir = getImporterDownloadsDir();
+    if (!downloadsDir) {
         return res.status(500).json({ success: false, message: 'Importer directory not found in deployment.' });
     }
 
-    const songsDir = path.join(importerBaseDir, 'downloads/songs');
-    const coversDir = path.join(importerBaseDir, 'downloads/covers');
+    const songsDir = path.join(downloadsDir, 'songs');
+    const coversDir = path.join(downloadsDir, 'covers');
 
     const authHeader = req.headers['authorization'] || '';
     const token = authHeader.replace(/^Bearer\s+/i, '').trim();
