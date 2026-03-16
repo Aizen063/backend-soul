@@ -44,6 +44,13 @@ const startImport = (req, res) => {
         return res.status(400).json({ success: false, message: 'playlistUrl is required' });
     }
 
+    if (process.env.VERCEL) {
+        return res.status(503).json({
+            success: false,
+            message: 'YouTube import is not supported on Vercel. YouTube is challenging the serverless runtime as a bot. Run the importer on your local machine or deploy the backend to a VPS/worker host.',
+        });
+    }
+
     const jobId = `job-${++jobCounter}-${Date.now()}`;
     jobs[jobId] = { status: 'running', logs: [], startedAt: new Date().toISOString() };
 
