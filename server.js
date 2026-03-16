@@ -32,8 +32,27 @@ app.use(
         crossOriginResourcePolicy: { policy: 'cross-origin' }, // Allow static file serving
     })
 );
+const allowedOrigins = (process.env.CORS_ORIGIN || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
+
+if (!allowedOrigins.length) {
+    // Safe defaults for local development and current Vercel deployment.
+    allowedOrigins.push(
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+        'https://frontend-soul.vercel.app'
+    );
+}
+
 app.use(cors({
-    origin: process.env.CORS_ORIGIN || 'https://backend-soul.vercel.app',
+    origin: (origin, callback) => {
+        // Allow non-browser clients (no Origin header) and same-origin requests.
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.includes(origin)) return callback(null, true);
+        return callback(new Error(`CORS blocked for origin: ${origin}`));
+    },
     credentials: true,
 }));
 app.use(morgan(process.env.NODE_ENV === 'development' ? 'dev' : 'combined'));
