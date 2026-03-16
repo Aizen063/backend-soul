@@ -209,7 +209,11 @@ async function getToken() {
     rl.close();
 
     const res = await axios.post(`${API_BASE}/api/auth/login`, { email, password });
-    return res.data.token;
+    const token = res.data?.data?.token || res.data?.token;
+    if (!token) {
+        throw new Error(`Login succeeded but no token was returned by ${API_BASE}/api/auth/login`);
+    }
+    return token;
 }
 
 // ─── Artist lookup / creation ─────────────────────────────────────────────────
@@ -351,6 +355,7 @@ async function main() {
         ok('Authenticated.');
     } catch (e) {
         err(`Auth failed: ${e.response?.data?.message || e.message}`);
+        warn(`Importer API base: ${API_BASE}`);
         process.exit(1);
     }
 
