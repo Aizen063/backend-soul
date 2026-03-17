@@ -23,6 +23,7 @@ const fs = require('fs-extra');
 const axios = require('axios');
 const FormData = require('form-data');
 const play = require('play-dl');
+const ytDlpExec = require('yt-dlp-exec');
 const sharp = require('sharp');
 
 const importEnvPath = path.join(__dirname, '../../.env.import');
@@ -313,6 +314,35 @@ async function streamToFile(sourceStream, filePath) {
     });
 }
 
+async function downloadAudioWithYtDlp(url, stem) {
+    const outputTemplate = path.join(SONGS_DIR, `${stem}.%(ext)s`);
+    const beforeFiles = new Set(await fs.readdir(SONGS_DIR));
+
+    await ytDlpExec(url, {
+        noPlaylist: true,
+        format: 'bestaudio/best',
+        output: outputTemplate,
+        quiet: true,
+        noWarnings: true,
+    });
+
+    const afterFiles = await fs.readdir(SONGS_DIR);
+    const added = afterFiles
+        .filter((file) => !beforeFiles.has(file) && file.startsWith(`${stem}.`))
+        .filter((file) => !/\.(jpg|jpeg|png|webp)$/i.test(file));
+
+    if (!added.length) {
+        throw new Error('yt-dlp fallback completed but no audio file was created.');
+    }
+
+    const fileName = added[0];
+    const ext = path.extname(fileName).replace('.', '') || 'bin';
+    return {
+        audioPath: path.join(SONGS_DIR, fileName),
+        audioExt: ext,
+    };
+}
+
 async function downloadEntry(url, stem) {
     const normalizedUrl = normalizeVideoUrl(url);
     const info = await play.video_info(normalizedUrl);
@@ -323,27 +353,34 @@ async function downloadEntry(url, stem) {
     let audioExt;
     let audioPath;
 
-    if (audioFormats.length) {
-        const selectedFormat = audioFormats[0];
-        const selectedFormatUrl = toAbsoluteHttpUrl(selectedFormat.url);
-        if (!selectedFormatUrl) {
-            throw new Error('No usable direct audio URL in selected format.');
-        }
-        audioExt = extensionFromMimeType(selectedFormat.mimeType);
-        audioPath = path.join(SONGS_DIR, `${stem}.${audioExt}`);
+    try {
+        if (audioFormats.length) {
+            const selectedFormat = audioFormats[0];
+            const selectedFormatUrl = toAbsoluteHttpUrl(selectedFormat.url);
+            if (!selectedFormatUrl) {
+                throw new Error('No usable direct audio URL in selected format.');
+            }
+            audioExt = extensionFromMimeType(selectedFormat.mimeType);
+            audioPath = path.join(SONGS_DIR, `${stem}.${audioExt}`);
 
-        const audioResponse = await axios.get(selectedFormatUrl, {
-            responseType: 'stream',
-            timeout: 120000,
-            maxBodyLength: Infinity,
-            maxContentLength: Infinity,
-        });
-        await streamToFile(audioResponse.data, audioPath);
-    } else {
-        const streamedAudio = await play.stream(normalizedUrl, { quality: 2 });
-        audioExt = extensionFromStreamType(streamedAudio.type);
-        audioPath = path.join(SONGS_DIR, `${stem}.${audioExt}`);
-        await streamToFile(streamedAudio.stream, audioPath);
+            const audioResponse = await axios.get(selectedFormatUrl, {
+                responseType: 'stream',
+                timeout: 120000,
+                maxBodyLength: Infinity,
+                maxContentLength: Infinity,
+            });
+            await streamToFile(audioResponse.data, audioPath);
+        } else {
+            const streamedAudio = await play.stream(normalizedUrl, { quality: 2 });
+            audioExt = extensionFromStreamType(streamedAudio.type);
+            audioPath = path.join(SONGS_DIR, `${stem}.${audioExt}`);
+            await streamToFile(streamedAudio.stream, audioPath);
+        }
+    } catch (primaryError) {
+        warn(`Primary downloader failed (${primaryError.message}). Trying yt-dlp fallback...`);
+        const fallback = await downloadAudioWithYtDlp(normalizedUrl, stem);
+        audioPath = fallback.audioPath;
+        audioExt = fallback.audioExt;
     }
 
     const thumbnailUrl = toAbsoluteHttpUrl(info.video_details?.thumbnails?.at(-1)?.url);
