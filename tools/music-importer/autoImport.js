@@ -220,7 +220,8 @@ async function getToken() {
     if (!token) {
         throw new Error(`Login succeeded but no token was returned by ${API_BASE}/api/auth/login`);
     }
-    return token;
+    const role = res.data?.data?.role;
+    return { token, role };
 }
 
 // ─── Artist lookup / creation ─────────────────────────────────────────────────
@@ -292,6 +293,15 @@ const extensionFromStreamType = (streamType = '') => {
     return 'm4a';
 };
 
+const toAbsoluteHttpUrl = (value) => {
+    if (!value || typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    if (trimmed.startsWith('//')) return `https:${trimmed}`;
+    if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) return trimmed;
+    return null;
+};
+
 async function streamToFile(sourceStream, filePath) {
     await fs.ensureDir(path.dirname(filePath));
     await new Promise((resolve, reject) => {
@@ -315,10 +325,14 @@ async function downloadEntry(url, stem) {
 
     if (audioFormats.length) {
         const selectedFormat = audioFormats[0];
+        const selectedFormatUrl = toAbsoluteHttpUrl(selectedFormat.url);
+        if (!selectedFormatUrl) {
+            throw new Error('No usable direct audio URL in selected format.');
+        }
         audioExt = extensionFromMimeType(selectedFormat.mimeType);
         audioPath = path.join(SONGS_DIR, `${stem}.${audioExt}`);
 
-        const audioResponse = await axios.get(selectedFormat.url, {
+        const audioResponse = await axios.get(selectedFormatUrl, {
             responseType: 'stream',
             timeout: 120000,
             maxBodyLength: Infinity,
@@ -332,7 +346,7 @@ async function downloadEntry(url, stem) {
         await streamToFile(streamedAudio.stream, audioPath);
     }
 
-    const thumbnailUrl = info.video_details?.thumbnails?.at(-1)?.url;
+    const thumbnailUrl = toAbsoluteHttpUrl(info.video_details?.thumbnails?.at(-1)?.url);
     const jpgPath = path.join(COVERS_DIR, `${stem}.jpg`);
     let hasCover = false;
 
@@ -373,7 +387,27 @@ async function main() {
 
     let token;
     try {
-        token = await getToken();
+        const authResult = await getToken();
+        token = typeof authResult === 'string' ? authResult : authResult.token;
+
+        let userRole = typeof authResult === 'string' ? '' : authResult.role;
+        if (!userRole) {
+            try {
+                const me = await axios.get(`${API_BASE}/api/auth/me`, {
+                    headers: { Authorization: `Bearer ${token}` },
+                });
+                userRole = me.data?.data?.role || '';
+            } catch {
+                // ignore; upload endpoints will still enforce permissions
+            }
+        }
+
+        if (userRole && userRole !== 'admin') {
+            err(`Authenticated user is role "${userRole}", not admin.`);
+            warn('Importer requires an admin account because artist/song creation endpoints are admin-only.');
+            process.exit(1);
+        }
+
         ok('Authenticated.');
     } catch (e) {
         err(`Auth failed: ${e.response?.data?.message || e.message}`);
@@ -459,7 +493,7 @@ async function main() {
         try {
             artistId = await getOrCreateArtist(refreshedMeta.artist || artist, token);
         } catch (e) {
-            err(`Artist lookup/creation failed: ${e.message}`);
+            err(`Artist lookup/creation failed: ${e.response?.status || ''} ${e.response?.data?.message || e.message}`.trim());
             summary.failed++;
             continue;
         }
@@ -489,7 +523,7 @@ async function main() {
             _existingTitles?.add((refreshedMeta.title || title).toLowerCase().trim());
             summary.success++;
         } catch (e) {
-            err(`Upload failed: ${e.response?.data?.message || e.message}`);
+            err(`Upload failed: ${e.response?.status || ''} ${e.response?.data?.message || e.message}`.trim());
             summary.failed++;
         }
     }
@@ -500,6 +534,10 @@ async function main() {
     summary.skipped && warn(`Skipped  : ${summary.skipped} (duplicates)`);
     summary.failed && err(`Failed   : ${summary.failed}`);
     console.log('\x1b[35m╚═════════════════════════════════════╝\x1b[0m\n');
+
+    if (summary.failed > 0) {
+        process.exit(1);
+    }
 }
 
 main().catch(e => {
