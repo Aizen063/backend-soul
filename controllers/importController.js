@@ -136,6 +136,7 @@ const listDownloads = (req, res) => {
     }
     const songsDir = path.join(downloadsDir, 'songs');
     const coversDir = path.join(downloadsDir, 'covers');
+    const metadataDir = path.join(downloadsDir, 'metadata');
 
     if (!fs.existsSync(songsDir)) {
         return res.json({ success: true, data: [] });
@@ -166,6 +167,26 @@ const listDownloads = (req, res) => {
             if (!coversByStem[stem]) coversByStem[stem] = `__songs__/${f}`;
         }
     });
+
+    const metadataByStem = {};
+    if (fs.existsSync(metadataDir)) {
+        fs.readdirSync(metadataDir)
+            .filter((f) => f.toLowerCase().endsWith('.json'))
+            .forEach((f) => {
+                const stem = f.slice(0, -5);
+                try {
+                    const parsed = JSON.parse(fs.readFileSync(path.join(metadataDir, f), 'utf8'));
+                    metadataByStem[stem] = {
+                        album: (parsed?.album || '').toString().trim(),
+                        genre: (parsed?.genre || '').toString().trim(),
+                        artist: (parsed?.artist || '').toString().trim(),
+                        title: (parsed?.title || '').toString().trim(),
+                    };
+                } catch {
+                    // Ignore malformed metadata files
+                }
+            });
+    }
 
     const data = audioFiles.map(filename => {
         const ext = path.extname(filename);
@@ -207,8 +228,18 @@ const listDownloads = (req, res) => {
         artist = cap(artist);
 
         const coverFile = coversByStem[stem] || null;
+        const meta = metadataByStem[stem] || null;
 
-        return { filename, stem, ext: ext.replace('.', ''), coverFile, title, artist, album: '', genre: '' };
+        return {
+            filename,
+            stem,
+            ext: ext.replace('.', ''),
+            coverFile,
+            title: meta?.title || title,
+            artist: meta?.artist || artist,
+            album: meta?.album || '',
+            genre: meta?.genre || '',
+        };
     });
 
     return res.json({ success: true, count: data.length, data });
@@ -226,6 +257,7 @@ const clearDownloads = (req, res) => {
     const dirs = [
         path.join(downloadsDir, 'songs'),
         path.join(downloadsDir, 'covers'),
+        path.join(downloadsDir, 'metadata'),
     ];
 
     let deleted = 0;

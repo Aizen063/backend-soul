@@ -108,9 +108,11 @@ const DOWNLOAD_DIR = process.env.IMPORT_DOWNLOAD_DIR
         : path.join(__dirname, 'downloads'));
 const SONGS_DIR = path.join(DOWNLOAD_DIR, 'songs');
 const COVERS_DIR = path.join(DOWNLOAD_DIR, 'covers');
+const META_DIR = path.join(DOWNLOAD_DIR, 'metadata');
 
 fs.ensureDirSync(SONGS_DIR);
 fs.ensureDirSync(COVERS_DIR);
+fs.ensureDirSync(META_DIR);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const log = (msg) => console.log(`\x1b[36m[importer]\x1b[0m ${msg}`);
@@ -247,6 +249,28 @@ function extractMeta(info) {
     }
 
     return { title, artist };
+}
+
+function extractAlbumName(info, fallbackAlbum = '') {
+    const details = info?.video_details || info || {};
+    const musicMeta = Array.isArray(details.music) ? details.music : [];
+
+    const musicAlbum = musicMeta.find((item) => {
+        const joined = `${item?.song || ''} ${item?.category || ''} ${item?.url || ''}`.toLowerCase();
+        return joined.includes('album');
+    })?.album;
+
+    const candidate = (
+        details.album?.name
+        || details.album
+        || musicAlbum
+        || details.playlist
+        || fallbackAlbum
+        || ''
+    ).toString().trim();
+
+    if (!candidate || /^unknown album$/i.test(candidate)) return '';
+    return candidate;
 }
 
 // ─── Auth ─────────────────────────────────────────────────────────────────────
@@ -501,12 +525,16 @@ async function getPlaylistEntries(playlistUrl) {
         const playlist = await play.playlist_info(normalizedPlaylistUrl, { incomplete: true });
         const entries = await playlist.all_videos();
         log(`Found ${entries.length} track(s) in playlist.`);
-        return entries;
+        const playlistAlbum = (playlist?.title || '').toString().trim();
+        return {
+            entries,
+            playlistAlbum: !playlistAlbum || /^uploads|mix$/i.test(playlistAlbum) ? '' : playlistAlbum,
+        };
     } catch (playlistError) {
         const normalizedVideoUrl = normalizeVideoUrl(playlistUrl);
         const videoInfo = await play.video_basic_info(normalizedVideoUrl);
         log('Input is not a playlist. Falling back to single-video import.');
-        return [videoInfo.video_details];
+        return { entries: [videoInfo.video_details], playlistAlbum: '' };
     }
 }
 
@@ -547,8 +575,11 @@ async function main() {
     }
 
     let entries;
+    let playlistAlbum = '';
     try {
-        entries = await getPlaylistEntries(PLAYLIST_URL);
+        const playlistResult = await getPlaylistEntries(PLAYLIST_URL);
+        entries = playlistResult.entries;
+        playlistAlbum = playlistResult.playlistAlbum || '';
     } catch (e) {
         err(`Failed to fetch playlist: ${e.message}`);
         process.exit(1);
@@ -612,6 +643,11 @@ async function main() {
             log(`Resolved artist: ${refreshedMeta.artist}`);
         }
 
+        const resolvedAlbum = extractAlbumName(info, extractAlbumName(entry, playlistAlbum)) || playlistAlbum || '';
+        if (resolvedAlbum) {
+            log(`Album:  ${resolvedAlbum}`);
+        }
+
         if (!hasCover) {
             warn('No thumbnail found — uploading without cover');
         } else {
@@ -635,9 +671,23 @@ async function main() {
             const form = new FormData();
             form.append('title', refreshedMeta.title || title);
             form.append('artistId', artistId);
+            if (resolvedAlbum) {
+                form.append('album', resolvedAlbum);
+            }
             form.append('audio', fs.createReadStream(audioPath), `${stem}.${audioExt}`);
             if (hasCover && fs.existsSync(jpgPath)) {
                 form.append('coverImage', fs.createReadStream(jpgPath), `${stem}.jpg`);
+            }
+
+            try {
+                await fs.writeJson(path.join(META_DIR, `${stem}.json`), {
+                    title: refreshedMeta.title || title,
+                    artist: refreshedMeta.artist || artist,
+                    album: resolvedAlbum || '',
+                    genre: '',
+                }, { spaces: 2 });
+            } catch (metaErr) {
+                warn(`Could not write metadata for ${stem}: ${metaErr.message}`);
             }
 
             await axios.post(`${API_BASE}/api/songs`, form, {
