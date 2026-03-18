@@ -63,6 +63,10 @@ const PLAYLIST_URL = positionalArgs[0];
 
 const API_BASE = getArg('--api', process.env.API_BASE || 'http://localhost:5000');
 const TOKEN_ARG = getArg('--token', process.env.IMPORT_TOKEN || '');
+const PREFER_YTDLP =
+    process.env.IMPORT_PREFER_YTDLP === 'true'
+    || process.env.RENDER === 'true'
+    || !!process.env.VERCEL;
 
 let _ytDlpCookiesFilePath = null;
 
@@ -113,6 +117,16 @@ const log = (msg) => console.log(`\x1b[36m[importer]\x1b[0m ${msg}`);
 const ok = (msg) => console.log(`\x1b[32m[✓]\x1b[0m ${msg}`);
 const warn = (msg) => console.log(`\x1b[33m[!]\x1b[0m ${msg}`);
 const err = (msg) => console.log(`\x1b[31m[✗]\x1b[0m ${msg}`);
+
+process.on('unhandledRejection', (reason) => {
+    err(`Unhandled rejection: ${reason?.message || reason}`);
+    process.exit(1);
+});
+
+process.on('uncaughtException', (error) => {
+    err(`Uncaught exception: ${error?.message || error}`);
+    process.exit(1);
+});
 
 /** Sanitise a string into a safe filename stem (no extension). */
 function safeStem(str) {
@@ -383,18 +397,58 @@ async function downloadAudioWithYtDlp(url, stem) {
     };
 }
 
+async function getVideoInfoWithYtDlp(url) {
+    const ytdlpOptions = {
+        dumpSingleJson: true,
+        skipDownload: true,
+        noWarnings: true,
+        quiet: true,
+    };
+
+    const cookiesPath = await getYtDlpCookiesFilePath();
+    if (cookiesPath) {
+        ytdlpOptions.cookies = cookiesPath;
+    }
+
+    return ytDlpExec(url, ytdlpOptions);
+}
+
 async function downloadEntry(url, stem) {
     const normalizedUrl = normalizeVideoUrl(url);
-    const info = await play.video_info(normalizedUrl);
-    const audioFormats = (info.format || [])
-        .filter((format) => typeof format.mimeType === 'string' && format.mimeType.startsWith('audio/') && format.url)
-        .sort((left, right) => (Number(right.bitrate || right.averageBitrate || 0) - Number(left.bitrate || left.averageBitrate || 0)));
+    const useYtdlpPrimary = PREFER_YTDLP;
+
+    let info;
+    let audioFormats = [];
+
+    if (useYtdlpPrimary) {
+        const ytdlpInfo = await getVideoInfoWithYtDlp(normalizedUrl);
+        info = {
+            video_details: {
+                title: ytdlpInfo.title,
+                artist: ytdlpInfo.artist,
+                creator: ytdlpInfo.creator,
+                uploader: ytdlpInfo.uploader,
+                channel: { name: ytdlpInfo.channel || ytdlpInfo.uploader || '' },
+                thumbnails: (ytdlpInfo.thumbnails || []).map((thumb) => ({ url: thumb.url })),
+            },
+            format: [],
+        };
+    } else {
+        info = await play.video_info(normalizedUrl);
+        audioFormats = (info.format || [])
+            .filter((format) => typeof format.mimeType === 'string' && format.mimeType.startsWith('audio/') && format.url)
+            .sort((left, right) => (Number(right.bitrate || right.averageBitrate || 0) - Number(left.bitrate || left.averageBitrate || 0)));
+    }
 
     let audioExt;
     let audioPath;
 
     try {
-        if (audioFormats.length) {
+        if (useYtdlpPrimary) {
+            const fallback = await downloadAudioWithYtDlp(normalizedUrl, stem);
+            audioPath = fallback.audioPath;
+            audioExt = fallback.audioExt;
+        } else if (audioFormats.length) {
             const selectedFormat = audioFormats[0];
             const selectedFormatUrl = toAbsoluteHttpUrl(selectedFormat.url);
             if (!selectedFormatUrl) {
