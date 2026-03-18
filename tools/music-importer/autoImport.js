@@ -64,6 +64,39 @@ const PLAYLIST_URL = positionalArgs[0];
 const API_BASE = getArg('--api', process.env.API_BASE || 'http://localhost:5000');
 const TOKEN_ARG = getArg('--token', process.env.IMPORT_TOKEN || '');
 
+let _ytDlpCookiesFilePath = null;
+
+async function getYtDlpCookiesFilePath() {
+    if (_ytDlpCookiesFilePath) return _ytDlpCookiesFilePath;
+
+    if (process.env.YTDLP_COOKIE_FILE && await fs.pathExists(process.env.YTDLP_COOKIE_FILE)) {
+        _ytDlpCookiesFilePath = process.env.YTDLP_COOKIE_FILE;
+        return _ytDlpCookiesFilePath;
+    }
+
+    const cookiesText = process.env.YTDLP_COOKIES_TEXT;
+    const cookiesBase64 = process.env.YTDLP_COOKIES_B64;
+    let decoded = '';
+
+    if (cookiesText && cookiesText.trim()) {
+        decoded = cookiesText;
+    } else if (cookiesBase64 && cookiesBase64.trim()) {
+        try {
+            decoded = Buffer.from(cookiesBase64, 'base64').toString('utf8');
+        } catch {
+            warn('Could not decode YTDLP_COOKIES_B64. Falling back without cookies.');
+            return null;
+        }
+    }
+
+    if (!decoded.trim()) return null;
+
+    const cookiePath = path.join(os.tmpdir(), 'soul-sound-ytdlp-cookies.txt');
+    await fs.writeFile(cookiePath, decoded, 'utf8');
+    _ytDlpCookiesFilePath = cookiePath;
+    return _ytDlpCookiesFilePath;
+}
+
 // ─── Dirs ─────────────────────────────────────────────────────────────────────
 const DOWNLOAD_DIR = process.env.IMPORT_DOWNLOAD_DIR
     || (process.env.VERCEL
@@ -318,13 +351,20 @@ async function downloadAudioWithYtDlp(url, stem) {
     const outputTemplate = path.join(SONGS_DIR, `${stem}.%(ext)s`);
     const beforeFiles = new Set(await fs.readdir(SONGS_DIR));
 
-    await ytDlpExec(url, {
+    const ytdlpOptions = {
         noPlaylist: true,
         format: 'bestaudio/best',
         output: outputTemplate,
         quiet: true,
         noWarnings: true,
-    });
+    };
+
+    const cookiesPath = await getYtDlpCookiesFilePath();
+    if (cookiesPath) {
+        ytdlpOptions.cookies = cookiesPath;
+    }
+
+    await ytDlpExec(url, ytdlpOptions);
 
     const afterFiles = await fs.readdir(SONGS_DIR);
     const added = afterFiles
