@@ -6,6 +6,7 @@ node_modules/
 .env.local
 .env.development
 .env.production
+.env.import
 
 # Logs
 logs/
@@ -22,6 +23,7 @@ pids/
 
 # uploads (user-generated content)
 uploads/
+tools/music-importer/downloads/
 
 # OS files
 .DS_Store
