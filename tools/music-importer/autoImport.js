@@ -20,10 +20,10 @@
 const path = require('path');
 const os = require('os');
 const fs = require('fs-extra');
+const { spawnSync } = require('child_process');
 const axios = require('axios');
 const FormData = require('form-data');
 const play = require('play-dl');
-const SpotifyWebApi = require('spotify-web-api-node');
 const ytDlpExec = require('yt-dlp-exec');
 const sharp = require('sharp');
 
@@ -68,14 +68,6 @@ const PREFER_YTDLP =
     process.env.IMPORT_PREFER_YTDLP === 'true'
     || process.env.RENDER === 'true'
     || !!process.env.VERCEL;
-const MAX_SPOTIFY_PLAYLIST_TRACKS = Number(process.env.IMPORT_SPOTIFY_MAX_TRACKS || '120');
-
-const spotifyClientId = (process.env.SPOTIFY_CLIENT_ID || '').trim();
-const spotifyClientSecret = (process.env.SPOTIFY_CLIENT_SECRET || '').trim();
-const spotifyApi = spotifyClientId && spotifyClientSecret
-    ? new SpotifyWebApi({ clientId: spotifyClientId, clientSecret: spotifyClientSecret })
-    : null;
-let spotifyAccessTokenExpiresAt = 0;
 
 let _ytDlpCookiesFilePath = null;
 
@@ -425,157 +417,110 @@ function buildSpotifyTrackUrl(trackId) {
     return `https://open.spotify.com/track/${trackId}`;
 }
 
-async function resolveSpotifyTrack(trackId) {
-    const spotifyTrackUrl = buildSpotifyTrackUrl(trackId);
-    const oEmbedUrl = `https://open.spotify.com/oembed?url=${encodeURIComponent(spotifyTrackUrl)}`;
+const AUDIO_EXTS = ['.mp3', '.webm', '.ogg', '.flac', '.m4a', '.opus', '.wav', '.aac'];
 
-    const response = await axios.get(oEmbedUrl, { timeout: 30000 });
-    const data = response.data || {};
-    const title = (data.title || '').toString().trim();
-    const artist = (data.author_name || '').toString().trim();
+function parseStemToMeta(stem) {
+    let title = '';
+    let artist = '';
 
-    if (!title) {
-        throw new Error('Could not read track title from Spotify link.');
-    }
-
-    return {
-        title,
-        artist: artist || 'Unknown Artist',
-        spotifyTrackUrl,
-    };
-}
-
-async function ensureSpotifyAccessToken() {
-    if (!spotifyApi) {
-        throw new Error('Spotify playlist import requires SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in backend environment.');
-    }
-
-    if (spotifyAccessTokenExpiresAt && Date.now() < spotifyAccessTokenExpiresAt) {
-        return;
-    }
-
-    const auth = await spotifyApi.clientCredentialsGrant();
-    const accessToken = auth?.body?.access_token;
-    const expiresIn = Number(auth?.body?.expires_in || 3600);
-
-    if (!accessToken) {
-        throw new Error('Failed to get Spotify API access token.');
-    }
-
-    spotifyApi.setAccessToken(accessToken);
-    spotifyAccessTokenExpiresAt = Date.now() + Math.max(expiresIn - 60, 60) * 1000;
-}
-
-async function resolveSpotifyPlaylist(playlistId) {
-    await ensureSpotifyAccessToken();
-
-    let playlistName = '';
-    try {
-        const playlist = await spotifyApi.getPlaylist(playlistId, { fields: 'name' });
-        playlistName = (playlist?.body?.name || '').toString().trim();
-    } catch {
-        // Non-fatal; we can still import tracks.
-    }
-
-    const entries = [];
-    let offset = 0;
-    const pageLimit = 100;
-
-    while (entries.length < MAX_SPOTIFY_PLAYLIST_TRACKS) {
-        const remaining = MAX_SPOTIFY_PLAYLIST_TRACKS - entries.length;
-        const limit = Math.min(pageLimit, remaining);
-
-        const page = await spotifyApi.getPlaylistTracks(playlistId, {
-            offset,
-            limit,
-            fields: 'items(track(name,artists(name),external_urls,is_local)),next,total',
-        });
-
-        const items = page?.body?.items || [];
-        if (!items.length) break;
-
-        for (const item of items) {
-            if (entries.length >= MAX_SPOTIFY_PLAYLIST_TRACKS) break;
-
-            const track = item?.track;
-            if (!track || track.is_local) continue;
-
-            const title = (track.name || '').toString().trim();
-            const artist = Array.isArray(track.artists)
-                ? track.artists.map((a) => (a?.name || '').toString().trim()).filter(Boolean).join(', ')
-                : '';
-
-            if (!title) continue;
-
-            entries.push({
-                title,
-                artist: artist || 'Unknown Artist',
-                spotifyTrackUrl: track?.external_urls?.spotify || '',
-            });
-        }
-
-        if (!page?.body?.next) break;
-        offset += items.length;
-    }
-
-    if (!entries.length) {
-        throw new Error('No importable tracks found in Spotify playlist.');
-    }
-
-    log(`Resolved ${entries.length} Spotify track(s). Matching YouTube sources…`);
-
-    const mappedEntries = [];
-    for (let i = 0; i < entries.length; i++) {
-        const track = entries[i];
-        const query = `${track.title} ${track.artist} official audio`;
-        try {
-            const youtubeUrl = await searchYouTubeUrl(query);
-            mappedEntries.push({
-                title: track.title,
-                artist: track.artist,
-                url: youtubeUrl,
-                webpage_url: youtubeUrl,
-                source: 'spotify',
-                spotifyTrackUrl: track.spotifyTrackUrl,
-            });
-            log(`[Spotify ${i + 1}/${entries.length}] Matched: ${track.title}`);
-        } catch (matchError) {
-            warn(`[Spotify ${i + 1}/${entries.length}] Skipped (no YouTube match): ${track.title} — ${matchError.message}`);
+    if (stem.includes('---')) {
+        const parts = stem.split('---');
+        artist = parts[0].replace(/-/g, ' ').trim();
+        title = parts.slice(1).join(' ').replace(/-/g, ' ').trim();
+    } else {
+        const humanReadable = stem.replace(/-/g, ' ').replace(/\s{2,}/g, ' ').trim();
+        const sepMatch = humanReadable.match(/^(.+?)\s*[-–—|]\s+(.+)$/);
+        if (sepMatch) {
+            artist = sepMatch[1].trim();
+            title = sepMatch[2].trim();
+        } else {
+            title = humanReadable;
         }
     }
 
-    if (!mappedEntries.length) {
-        throw new Error('Could not match any Spotify playlist tracks to YouTube sources.');
-    }
-
+    const cap = (s) => s.replace(/\b\w/g, (c) => c.toUpperCase());
     return {
-        entries: mappedEntries,
-        playlistAlbum: playlistName || '',
+        title: cap(title || stem),
+        artist: cap(artist || 'Unknown Artist'),
     };
 }
 
-async function searchYouTubeUrl(query) {
-    const q = (query || '').toString().trim();
-    if (!q) throw new Error('Search query is required.');
+function runSpotDlDownload(spotifyUrl) {
+    let runner = { cmd: 'spotdl', prefix: [] };
+    const versionCheck = spawnSync('spotdl', ['--version'], { encoding: 'utf8' });
 
-    try {
-        const results = await play.search(q, { limit: 1, source: { youtube: 'video' } });
-        const first = Array.isArray(results) ? results[0] : null;
-        if (first?.url) return first.url;
-    } catch {
-        // Fallback to yt-dlp search below.
+    if (versionCheck.error || versionCheck.status !== 0) {
+        const pythonCandidates = [
+            process.env.IMPORT_PYTHON_BIN,
+            'python',
+            'python3',
+            'py',
+        ].filter(Boolean);
+
+        let pythonRunner = null;
+        for (const pyCmd of pythonCandidates) {
+            const probeArgs = pyCmd === 'py'
+                ? ['-m', 'spotdl', '--version']
+                : ['-m', 'spotdl', '--version'];
+            const probe = spawnSync(pyCmd, probeArgs, { encoding: 'utf8' });
+            if (!probe.error && probe.status === 0) {
+                pythonRunner = { cmd: pyCmd, prefix: ['-m', 'spotdl'] };
+                break;
+            }
+        }
+
+        if (!pythonRunner) {
+            throw new Error('spotDL is not installed or not available in PATH. Install it with: pip install spotdl');
+        }
+
+        runner = pythonRunner;
     }
 
-    const searchInfo = await ytDlpExec(`ytsearch1:${q}`, {
-        dumpSingleJson: true,
-        skipDownload: true,
-        quiet: true,
-        noWarnings: true,
+    const withRunner = (args) => [...runner.prefix, ...args];
+
+    const outputTemplate = path.join(SONGS_DIR, '{artist}---{title}.{output-ext}');
+    const beforeFiles = new Set(
+        fs.readdirSync(SONGS_DIR).filter((f) => AUDIO_EXTS.includes(path.extname(f).toLowerCase()))
+    );
+
+    const attemptA = spawnSync(runner.cmd, withRunner([spotifyUrl, '--output', outputTemplate, '--format', 'mp3']), {
+        encoding: 'utf8',
+        maxBuffer: 20 * 1024 * 1024,
     });
 
-    if (searchInfo?.webpage_url) return searchInfo.webpage_url;
-    if (searchInfo?.id) return `https://www.youtube.com/watch?v=${searchInfo.id}`;
-    throw new Error('No YouTube match found for this Spotify song.');
+    if (attemptA.status !== 0) {
+        const attemptB = spawnSync(runner.cmd, withRunner(['download', spotifyUrl, '--output', outputTemplate, '--format', 'mp3']), {
+            encoding: 'utf8',
+            maxBuffer: 20 * 1024 * 1024,
+        });
+
+        if (attemptB.status !== 0) {
+            const output = `${attemptB.stderr || ''}\n${attemptB.stdout || ''}`.trim() || `${attemptA.stderr || ''}\n${attemptA.stdout || ''}`.trim();
+            throw new Error(`spotDL failed: ${output.slice(-500)}`);
+        }
+    }
+
+    const afterFiles = fs.readdirSync(SONGS_DIR)
+        .filter((f) => AUDIO_EXTS.includes(path.extname(f).toLowerCase()));
+
+    const addedFiles = afterFiles.filter((f) => !beforeFiles.has(f));
+    if (!addedFiles.length) {
+        throw new Error('spotDL completed but no new audio files were created.');
+    }
+
+    return addedFiles.map((filename) => {
+        const ext = path.extname(filename);
+        const stem = filename.slice(0, filename.length - ext.length);
+        const meta = parseStemToMeta(stem);
+
+        return {
+            title: meta.title,
+            artist: meta.artist,
+            source: 'spotify',
+            localAudioPath: path.join(SONGS_DIR, filename),
+            audioExt: ext.replace('.', '') || 'mp3',
+        };
+    });
 }
 
 async function streamToFile(sourceStream, filePath) {
@@ -724,29 +669,15 @@ async function downloadEntry(url, stem) {
 // ─── Get flat playlist info ───────────────────────────────────────────────────
 async function getPlaylistEntries(playlistUrl) {
     const spotifyTrackId = parseSpotifyTrackId(playlistUrl);
-    if (spotifyTrackId) {
-        log('Spotify track link detected. Resolving metadata…');
-        const track = await resolveSpotifyTrack(spotifyTrackId);
-        const query = `${track.title} ${track.artist} official audio`;
-        const youtubeUrl = await searchYouTubeUrl(query);
-        log(`Matched Spotify track to YouTube source: ${youtubeUrl}`);
-        return {
-            entries: [{
-                title: track.title,
-                artist: track.artist,
-                url: youtubeUrl,
-                webpage_url: youtubeUrl,
-                source: 'spotify',
-                spotifyTrackUrl: track.spotifyTrackUrl,
-            }],
-            playlistAlbum: '',
-        };
-    }
-
     const spotifyPlaylistId = parseSpotifyPlaylistId(playlistUrl);
-    if (spotifyPlaylistId) {
-        log('Spotify playlist link detected. Resolving tracks via Spotify API…');
-        return resolveSpotifyPlaylist(spotifyPlaylistId);
+    if (spotifyTrackId || spotifyPlaylistId) {
+        log('Spotify link detected. Downloading with spotDL…');
+        const spotifyUrl = spotifyTrackId
+            ? buildSpotifyTrackUrl(spotifyTrackId)
+            : `https://open.spotify.com/playlist/${spotifyPlaylistId}`;
+        const entries = runSpotDlDownload(spotifyUrl);
+        log(`spotDL downloaded ${entries.length} track(s).`);
+        return { entries, playlistAlbum: '' };
     }
 
     log('Fetching playlist info (this may take a moment)…');
@@ -847,17 +778,33 @@ async function main() {
         const stem = (artist && artist !== 'Unknown Artist')
             ? `${artistStem}---${titleStem}`
             : titleStem;
-        log(`Downloading: ${title}`);
-        let downloadResult;
-        try {
-            downloadResult = await downloadEntry(videoUrl, stem);
-        } catch (e) {
-            err(`Download failed: ${e.message}`);
-            summary.failed++;
-            continue;
-        }
+        let info = { video_details: entry };
+        let audioPath = entry.localAudioPath || '';
+        let audioExt = entry.audioExt || '';
+        let jpgPath = '';
+        let hasCover = false;
 
-        const { info, audioPath, audioExt, jpgPath, hasCover } = downloadResult;
+        if (audioPath) {
+            log(`Using spotDL file: ${path.basename(audioPath)}`);
+            const inferredExt = path.extname(audioPath).replace('.', '');
+            if (!audioExt && inferredExt) audioExt = inferredExt;
+        } else {
+            log(`Downloading: ${title}`);
+            let downloadResult;
+            try {
+                downloadResult = await downloadEntry(videoUrl, stem);
+            } catch (e) {
+                err(`Download failed: ${e.message}`);
+                summary.failed++;
+                continue;
+            }
+
+            info = downloadResult.info;
+            audioPath = downloadResult.audioPath;
+            audioExt = downloadResult.audioExt;
+            jpgPath = downloadResult.jpgPath;
+            hasCover = downloadResult.hasCover;
+        }
 
         if (!fs.existsSync(audioPath)) {
             err(`Audio not found at expected path: ${audioPath}`);
