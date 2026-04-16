@@ -23,6 +23,7 @@ const fs = require('fs-extra');
 const axios = require('axios');
 const FormData = require('form-data');
 const play = require('play-dl');
+const SpotifyWebApi = require('spotify-web-api-node');
 const ytDlpExec = require('yt-dlp-exec');
 const sharp = require('sharp');
 
@@ -67,6 +68,14 @@ const PREFER_YTDLP =
     process.env.IMPORT_PREFER_YTDLP === 'true'
     || process.env.RENDER === 'true'
     || !!process.env.VERCEL;
+const MAX_SPOTIFY_PLAYLIST_TRACKS = Number(process.env.IMPORT_SPOTIFY_MAX_TRACKS || '120');
+
+const spotifyClientId = (process.env.SPOTIFY_CLIENT_ID || '').trim();
+const spotifyClientSecret = (process.env.SPOTIFY_CLIENT_SECRET || '').trim();
+const spotifyApi = spotifyClientId && spotifyClientSecret
+    ? new SpotifyWebApi({ clientId: spotifyClientId, clientSecret: spotifyClientSecret })
+    : null;
+let spotifyAccessTokenExpiresAt = 0;
 
 let _ytDlpCookiesFilePath = null;
 
@@ -374,6 +383,201 @@ const toAbsoluteHttpUrl = (value) => {
     return null;
 };
 
+function parseSpotifyTrackId(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== 'string') return '';
+    const input = rawUrl.trim();
+
+    const uriMatch = input.match(/^spotify:track:([a-zA-Z0-9]+)$/i);
+    if (uriMatch) return uriMatch[1];
+
+    if (!input.startsWith('http://') && !input.startsWith('https://')) return '';
+
+    try {
+        const parsed = new URL(input);
+        if (!/spotify\.com$/i.test(parsed.hostname)) return '';
+        const trackMatch = parsed.pathname.match(/\/track\/([a-zA-Z0-9]+)/i);
+        return trackMatch ? trackMatch[1] : '';
+    } catch {
+        return '';
+    }
+}
+
+function parseSpotifyPlaylistId(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== 'string') return '';
+    const input = rawUrl.trim();
+
+    const uriMatch = input.match(/^spotify:playlist:([a-zA-Z0-9]+)$/i);
+    if (uriMatch) return uriMatch[1];
+
+    if (!input.startsWith('http://') && !input.startsWith('https://')) return '';
+
+    try {
+        const parsed = new URL(input);
+        if (!/spotify\.com$/i.test(parsed.hostname)) return '';
+        const listMatch = parsed.pathname.match(/\/playlist\/([a-zA-Z0-9]+)/i);
+        return listMatch ? listMatch[1] : '';
+    } catch {
+        return '';
+    }
+}
+
+function buildSpotifyTrackUrl(trackId) {
+    return `https://open.spotify.com/track/${trackId}`;
+}
+
+async function resolveSpotifyTrack(trackId) {
+    const spotifyTrackUrl = buildSpotifyTrackUrl(trackId);
+    const oEmbedUrl = `https://open.spotify.com/oembed?url=${encodeURIComponent(spotifyTrackUrl)}`;
+
+    const response = await axios.get(oEmbedUrl, { timeout: 30000 });
+    const data = response.data || {};
+    const title = (data.title || '').toString().trim();
+    const artist = (data.author_name || '').toString().trim();
+
+    if (!title) {
+        throw new Error('Could not read track title from Spotify link.');
+    }
+
+    return {
+        title,
+        artist: artist || 'Unknown Artist',
+        spotifyTrackUrl,
+    };
+}
+
+async function ensureSpotifyAccessToken() {
+    if (!spotifyApi) {
+        throw new Error('Spotify playlist import requires SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in backend environment.');
+    }
+
+    if (spotifyAccessTokenExpiresAt && Date.now() < spotifyAccessTokenExpiresAt) {
+        return;
+    }
+
+    const auth = await spotifyApi.clientCredentialsGrant();
+    const accessToken = auth?.body?.access_token;
+    const expiresIn = Number(auth?.body?.expires_in || 3600);
+
+    if (!accessToken) {
+        throw new Error('Failed to get Spotify API access token.');
+    }
+
+    spotifyApi.setAccessToken(accessToken);
+    spotifyAccessTokenExpiresAt = Date.now() + Math.max(expiresIn - 60, 60) * 1000;
+}
+
+async function resolveSpotifyPlaylist(playlistId) {
+    await ensureSpotifyAccessToken();
+
+    let playlistName = '';
+    try {
+        const playlist = await spotifyApi.getPlaylist(playlistId, { fields: 'name' });
+        playlistName = (playlist?.body?.name || '').toString().trim();
+    } catch {
+        // Non-fatal; we can still import tracks.
+    }
+
+    const entries = [];
+    let offset = 0;
+    const pageLimit = 100;
+
+    while (entries.length < MAX_SPOTIFY_PLAYLIST_TRACKS) {
+        const remaining = MAX_SPOTIFY_PLAYLIST_TRACKS - entries.length;
+        const limit = Math.min(pageLimit, remaining);
+
+        const page = await spotifyApi.getPlaylistTracks(playlistId, {
+            offset,
+            limit,
+            fields: 'items(track(name,artists(name),external_urls,is_local)),next,total',
+        });
+
+        const items = page?.body?.items || [];
+        if (!items.length) break;
+
+        for (const item of items) {
+            if (entries.length >= MAX_SPOTIFY_PLAYLIST_TRACKS) break;
+
+            const track = item?.track;
+            if (!track || track.is_local) continue;
+
+            const title = (track.name || '').toString().trim();
+            const artist = Array.isArray(track.artists)
+                ? track.artists.map((a) => (a?.name || '').toString().trim()).filter(Boolean).join(', ')
+                : '';
+
+            if (!title) continue;
+
+            entries.push({
+                title,
+                artist: artist || 'Unknown Artist',
+                spotifyTrackUrl: track?.external_urls?.spotify || '',
+            });
+        }
+
+        if (!page?.body?.next) break;
+        offset += items.length;
+    }
+
+    if (!entries.length) {
+        throw new Error('No importable tracks found in Spotify playlist.');
+    }
+
+    log(`Resolved ${entries.length} Spotify track(s). Matching YouTube sources…`);
+
+    const mappedEntries = [];
+    for (let i = 0; i < entries.length; i++) {
+        const track = entries[i];
+        const query = `${track.title} ${track.artist} official audio`;
+        try {
+            const youtubeUrl = await searchYouTubeUrl(query);
+            mappedEntries.push({
+                title: track.title,
+                artist: track.artist,
+                url: youtubeUrl,
+                webpage_url: youtubeUrl,
+                source: 'spotify',
+                spotifyTrackUrl: track.spotifyTrackUrl,
+            });
+            log(`[Spotify ${i + 1}/${entries.length}] Matched: ${track.title}`);
+        } catch (matchError) {
+            warn(`[Spotify ${i + 1}/${entries.length}] Skipped (no YouTube match): ${track.title} — ${matchError.message}`);
+        }
+    }
+
+    if (!mappedEntries.length) {
+        throw new Error('Could not match any Spotify playlist tracks to YouTube sources.');
+    }
+
+    return {
+        entries: mappedEntries,
+        playlistAlbum: playlistName || '',
+    };
+}
+
+async function searchYouTubeUrl(query) {
+    const q = (query || '').toString().trim();
+    if (!q) throw new Error('Search query is required.');
+
+    try {
+        const results = await play.search(q, { limit: 1, source: { youtube: 'video' } });
+        const first = Array.isArray(results) ? results[0] : null;
+        if (first?.url) return first.url;
+    } catch {
+        // Fallback to yt-dlp search below.
+    }
+
+    const searchInfo = await ytDlpExec(`ytsearch1:${q}`, {
+        dumpSingleJson: true,
+        skipDownload: true,
+        quiet: true,
+        noWarnings: true,
+    });
+
+    if (searchInfo?.webpage_url) return searchInfo.webpage_url;
+    if (searchInfo?.id) return `https://www.youtube.com/watch?v=${searchInfo.id}`;
+    throw new Error('No YouTube match found for this Spotify song.');
+}
+
 async function streamToFile(sourceStream, filePath) {
     await fs.ensureDir(path.dirname(filePath));
     await new Promise((resolve, reject) => {
@@ -519,6 +723,32 @@ async function downloadEntry(url, stem) {
 
 // ─── Get flat playlist info ───────────────────────────────────────────────────
 async function getPlaylistEntries(playlistUrl) {
+    const spotifyTrackId = parseSpotifyTrackId(playlistUrl);
+    if (spotifyTrackId) {
+        log('Spotify track link detected. Resolving metadata…');
+        const track = await resolveSpotifyTrack(spotifyTrackId);
+        const query = `${track.title} ${track.artist} official audio`;
+        const youtubeUrl = await searchYouTubeUrl(query);
+        log(`Matched Spotify track to YouTube source: ${youtubeUrl}`);
+        return {
+            entries: [{
+                title: track.title,
+                artist: track.artist,
+                url: youtubeUrl,
+                webpage_url: youtubeUrl,
+                source: 'spotify',
+                spotifyTrackUrl: track.spotifyTrackUrl,
+            }],
+            playlistAlbum: '',
+        };
+    }
+
+    const spotifyPlaylistId = parseSpotifyPlaylistId(playlistUrl);
+    if (spotifyPlaylistId) {
+        log('Spotify playlist link detected. Resolving tracks via Spotify API…');
+        return resolveSpotifyPlaylist(spotifyPlaylistId);
+    }
+
     log('Fetching playlist info (this may take a moment)…');
     try {
         const normalizedPlaylistUrl = normalizePlaylistUrl(playlistUrl);
@@ -581,7 +811,7 @@ async function main() {
         entries = playlistResult.entries;
         playlistAlbum = playlistResult.playlistAlbum || '';
     } catch (e) {
-        err(`Failed to fetch playlist: ${e.message}`);
+        err(`Failed to resolve import source: ${e.message}`);
         process.exit(1);
     }
 

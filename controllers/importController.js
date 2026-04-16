@@ -34,20 +34,20 @@ const getImporterDownloadsDir = () => {
 };
 
 /**
- * @desc  Start a playlist import job
+ * @desc  Start an import job (YouTube playlist/video or Spotify track link)
  * @route POST /api/admin/import
  * @body  { playlistUrl: string }
  */
 const startImport = (req, res) => {
     const { playlistUrl } = req.body;
     if (!playlistUrl) {
-        return res.status(400).json({ success: false, message: 'playlistUrl is required' });
+        return res.status(400).json({ success: false, message: 'playlistUrl is required (YouTube URL or Spotify link)' });
     }
 
     if (process.env.VERCEL) {
         return res.status(503).json({
             success: false,
-            message: 'YouTube import is not supported on Vercel. YouTube is challenging the serverless runtime as a bot. Run the importer on your local machine or deploy the backend to a VPS/worker host.',
+            message: 'Import is not supported on Vercel. The downloader is blocked in serverless runtime. Run the importer on your local machine or deploy the backend to a VPS/worker host.',
         });
     }
 
