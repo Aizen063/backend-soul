@@ -20,7 +20,9 @@
 const path = require('path');
 const os = require('os');
 const fs = require('fs-extra');
+
 const { spawn, spawnSync } = require('child_process');
+
 const axios = require('axios');
 const FormData = require('form-data');
 const play = require('play-dl');
@@ -514,6 +516,7 @@ async function runSpotDlDownload(spotifyUrl) {
     const beforeFiles = new Set(
         fs.readdirSync(SONGS_DIR).filter((f) => AUDIO_EXTS.includes(path.extname(f).toLowerCase()))
     );
+
 
     try {
         await runSpotDlCommand(runner, [spotifyUrl, '--output', outputTemplate, '--format', 'mp3']);
