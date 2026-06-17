@@ -1,18 +1,25 @@
 #!/usr/bin/env node
 /**
- * autoImport.js — Bulk YouTube Playlist → Soul Sound Backend Importer
+ * autoImport.js — YouTube & Spotify → Soul Sound Backend Importer
  *
  * Usage:
- *   node tools/music-importer/autoImport.js "PLAYLIST_URL" [--token JWT] [--api http://localhost:5000]
- *   node tools/music-importer/autoImport.js --api https://backend-soul.onrender.com "PLAYLIST_URL"
+ *   node tools/music-importer/autoImport.js "URL" [--token JWT] [--api http://localhost:5000]
  *
- * Or via npm (from /backend):
- *   npm run import-music -- "PLAYLIST_URL"
- *   npm run import-live -- "PLAYLIST_URL"
+ * Supported URL types:
+ *   - YouTube playlist:  https://www.youtube.com/playlist?list=...
+ *   - YouTube video:     https://www.youtube.com/watch?v=...  or  https://youtu.be/...
+ *   - Spotify track:     https://open.spotify.com/track/...
+ *   - Spotify album:     https://open.spotify.com/album/...
+ *   - Spotify playlist:  https://open.spotify.com/playlist/...
  *
  * Auth:
  *   Pass --token <JWT>  OR set IMPORT_TOKEN in .env
  *   If omitted you will be prompted for admin email/password.
+ *
+ * Spotify (optional — enables metadata + album art):
+ *   Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in .env.import
+ *   Get free credentials at https://developer.spotify.com/dashboard
+ *   Without credentials the importer still works via YouTube search.
  */
 
 'use strict';
@@ -21,7 +28,7 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs-extra');
 
-const { spawn, spawnSync } = require('child_process');
+const { spawn } = require('child_process');
 
 const axios = require('axios');
 const FormData = require('form-data');
@@ -380,177 +387,204 @@ const toAbsoluteHttpUrl = (value) => {
 function parseSpotifyTrackId(rawUrl) {
     if (!rawUrl || typeof rawUrl !== 'string') return '';
     const input = rawUrl.trim();
-
     const uriMatch = input.match(/^spotify:track:([a-zA-Z0-9]+)$/i);
     if (uriMatch) return uriMatch[1];
-
     if (!input.startsWith('http://') && !input.startsWith('https://')) return '';
-
     try {
         const parsed = new URL(input);
         if (!/spotify\.com$/i.test(parsed.hostname)) return '';
-        const trackMatch = parsed.pathname.match(/\/track\/([a-zA-Z0-9]+)/i);
-        return trackMatch ? trackMatch[1] : '';
-    } catch {
-        return '';
-    }
+        const m = parsed.pathname.match(/\/track\/([a-zA-Z0-9]+)/i);
+        return m ? m[1] : '';
+    } catch { return ''; }
+}
+
+function parseSpotifyAlbumId(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== 'string') return '';
+    const input = rawUrl.trim();
+    const uriMatch = input.match(/^spotify:album:([a-zA-Z0-9]+)$/i);
+    if (uriMatch) return uriMatch[1];
+    if (!input.startsWith('http://') && !input.startsWith('https://')) return '';
+    try {
+        const parsed = new URL(input);
+        if (!/spotify\.com$/i.test(parsed.hostname)) return '';
+        const m = parsed.pathname.match(/\/album\/([a-zA-Z0-9]+)/i);
+        return m ? m[1] : '';
+    } catch { return ''; }
 }
 
 function parseSpotifyPlaylistId(rawUrl) {
     if (!rawUrl || typeof rawUrl !== 'string') return '';
     const input = rawUrl.trim();
-
     const uriMatch = input.match(/^spotify:playlist:([a-zA-Z0-9]+)$/i);
     if (uriMatch) return uriMatch[1];
-
     if (!input.startsWith('http://') && !input.startsWith('https://')) return '';
-
     try {
         const parsed = new URL(input);
         if (!/spotify\.com$/i.test(parsed.hostname)) return '';
-        const listMatch = parsed.pathname.match(/\/playlist\/([a-zA-Z0-9]+)/i);
-        return listMatch ? listMatch[1] : '';
-    } catch {
-        return '';
-    }
+        const m = parsed.pathname.match(/\/playlist\/([a-zA-Z0-9]+)/i);
+        return m ? m[1] : '';
+    } catch { return ''; }
 }
 
-function buildSpotifyTrackUrl(trackId) {
-    return `https://open.spotify.com/track/${trackId}`;
+// ─── Spotify Web API client (Client Credentials — no user login needed) ───────
+let _spotifyToken = null;
+let _spotifyTokenExpiry = 0;
+
+async function getSpotifyAccessToken() {
+    const clientId = process.env.SPOTIFY_CLIENT_ID;
+    const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
+    if (!clientId || !clientSecret) return null;
+
+    if (_spotifyToken && Date.now() < _spotifyTokenExpiry) return _spotifyToken;
+
+    const creds = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+    const res = await axios.post(
+        'https://accounts.spotify.com/api/token',
+        'grant_type=client_credentials',
+        { headers: { Authorization: `Basic ${creds}`, 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    _spotifyToken = res.data.access_token;
+    _spotifyTokenExpiry = Date.now() + (res.data.expires_in - 60) * 1000;
+    return _spotifyToken;
 }
 
-const AUDIO_EXTS = ['.mp3', '.webm', '.ogg', '.flac', '.m4a', '.opus', '.wav', '.aac'];
+async function spotifyGet(endpoint) {
+    const token = await getSpotifyAccessToken();
+    if (!token) throw new Error('No Spotify credentials. Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in .env.import');
+    const res = await axios.get(`https://api.spotify.com/v1${endpoint}`, {
+        headers: { Authorization: `Bearer ${token}` },
+    });
+    return res.data;
+}
 
-function parseStemToMeta(stem) {
-    let title = '';
-    let artist = '';
-
-    if (stem.includes('---')) {
-        const parts = stem.split('---');
-        artist = parts[0].replace(/-/g, ' ').trim();
-        title = parts.slice(1).join(' ').replace(/-/g, ' ').trim();
-    } else {
-        const humanReadable = stem.replace(/-/g, ' ').replace(/\s{2,}/g, ' ').trim();
-        const sepMatch = humanReadable.match(/^(.+?)\s*[-–—|]\s+(.+)$/);
-        if (sepMatch) {
-            artist = sepMatch[1].trim();
-            title = sepMatch[2].trim();
-        } else {
-            title = humanReadable;
-        }
-    }
-
-    const cap = (s) => s.replace(/\b\w/g, (c) => c.toUpperCase());
+/** Convert a Spotify track object to an importer entry. */
+function spotifyTrackToEntry(track, albumName = '', albumCoverUrl = '') {
+    const artists = (track.artists || []).map(a => a.name).join(', ') || 'Unknown Artist';
+    const album = track.album?.name || albumName || '';
+    const images = track.album?.images || [];
+    const coverUrl = images[0]?.url || albumCoverUrl || '';
     return {
-        title: cap(title || stem),
-        artist: cap(artist || 'Unknown Artist'),
+        title: track.name || 'Unknown',
+        artist: artists,
+        album,
+        coverUrl,
+        source: 'spotify',
+        // These fields tell the main loop to skip downloadEntry and use searchAndDownload
+        isSpotify: true,
     };
 }
 
-async function runSpotDlCommand(runner, args) {
-    return new Promise((resolve, reject) => {
-        const child = spawn(runner.cmd, [...runner.prefix, ...args], {
-            cwd: process.cwd(),
-            env: process.env,
-            stdio: ['ignore', 'pipe', 'pipe'],
-        });
-
-        let combined = '';
-        child.stdout.on('data', (chunk) => {
-            const text = chunk.toString();
-            process.stdout.write(text);
-            combined += text;
-        });
-        child.stderr.on('data', (chunk) => {
-            const text = chunk.toString();
-            process.stderr.write(text);
-            combined += text;
-        });
-
-        child.on('error', (error) => reject(error));
-        child.on('close', (code) => {
-            if (code === 0) return resolve(combined);
-            const tail = combined.slice(-1200);
-            if (/rate\/request limit|retry will occur after/i.test(tail)) {
-                return reject(new Error('Spotify rate limit reached while using spotDL. Try again later or set SPOTIPY_CLIENT_ID and SPOTIPY_CLIENT_SECRET for your own Spotify app credentials.'));
-            }
-            return reject(new Error(`spotDL exited with code ${code}. ${tail}`));
-        });
-    });
+/** Fetch a single Spotify track and return an entries array. */
+async function getSpotifyTrackEntries(trackId) {
+    log('Fetching Spotify track metadata…');
+    const track = await spotifyGet(`/tracks/${trackId}`);
+    return { entries: [spotifyTrackToEntry(track)], playlistAlbum: '' };
 }
 
-async function runSpotDlDownload(spotifyUrl) {
-    let runner = { cmd: 'spotdl', prefix: [] };
-    const versionCheck = spawnSync('spotdl', ['--version'], { encoding: 'utf8' });
+/** Fetch all tracks from a Spotify album. */
+async function getSpotifyAlbumEntries(albumId) {
+    log('Fetching Spotify album metadata…');
+    const album = await spotifyGet(`/albums/${albumId}`);
+    const albumName = album.name || '';
+    const coverUrl = album.images?.[0]?.url || '';
 
-    if (versionCheck.error || versionCheck.status !== 0) {
-        const pythonCandidates = [
-            process.env.IMPORT_PYTHON_BIN,
-            'python',
-            'python3',
-            'py',
-        ].filter(Boolean);
+    const entries = (album.tracks?.items || []).map(track => {
+        const artists = (track.artists || []).map(a => a.name).join(', ') || 'Unknown Artist';
+        return { title: track.name, artist: artists, album: albumName, coverUrl, source: 'spotify', isSpotify: true };
+    });
+    log(`Found ${entries.length} track(s) in album "${albumName}".`);
+    return { entries, playlistAlbum: albumName };
+}
 
-        let pythonRunner = null;
-        for (const pyCmd of pythonCandidates) {
-            const probeArgs = pyCmd === 'py'
-                ? ['-m', 'spotdl', '--version']
-                : ['-m', 'spotdl', '--version'];
-            const probe = spawnSync(pyCmd, probeArgs, { encoding: 'utf8' });
-            if (!probe.error && probe.status === 0) {
-                pythonRunner = { cmd: pyCmd, prefix: ['-m', 'spotdl'] };
-                break;
-            }
-        }
+/** Fetch all tracks from a Spotify playlist (handles pagination). */
+async function getSpotifyPlaylistEntries(playlistId) {
+    log('Fetching Spotify playlist metadata…');
+    const playlist = await spotifyGet(`/playlists/${playlistId}?fields=name,images,tracks(items(track(name,artists,album(name,images))),next)`);
+    const playlistName = playlist.name || '';
 
-        if (!pythonRunner) {
-            throw new Error('spotDL is not installed or not available in PATH. Install it with: pip install spotdl');
-        }
+    let items = playlist.tracks?.items || [];
+    let nextUrl = playlist.tracks?.next;
 
-        runner = pythonRunner;
+    // Paginate through all tracks
+    while (nextUrl) {
+        const token = await getSpotifyAccessToken();
+        const res = await axios.get(nextUrl, { headers: { Authorization: `Bearer ${token}` } });
+        items = items.concat(res.data.items || []);
+        nextUrl = res.data.next;
     }
 
-    const withRunner = (args) => [...runner.prefix, ...args];
+    const entries = items
+        .filter(item => item?.track)
+        .map(item => spotifyTrackToEntry(item.track));
 
-    const outputTemplate = path.join(SONGS_DIR, '{artist}---{title}.{output-ext}');
-    const beforeFiles = new Set(
-        fs.readdirSync(SONGS_DIR).filter((f) => AUDIO_EXTS.includes(path.extname(f).toLowerCase()))
-    );
+    log(`Found ${entries.length} track(s) in playlist "${playlistName}".`);
+    return { entries, playlistAlbum: playlistName };
+}
 
+/**
+ * Search YouTube for a Spotify track and download audio + cover.
+ * Uses yt-dlp's built-in ytsearch: to find the best match.
+ */
+async function searchAndDownloadSpotify(entry, stem) {
+    const query = `${entry.artist} - ${entry.title}`;
+    log(`Searching YouTube: "${query}"`);
 
+    // Use ytsearch1: to get the top result
+    const searchUrl = `ytsearch1:${query}`;
+
+    const ytdlpInfoOptions = {
+        dumpSingleJson: true,
+        skipDownload: true,
+        noWarnings: true,
+        quiet: true,
+        jsRuntimes: 'node',
+        noPlaylist: true,
+    };
+    const cookiesPath = await getYtDlpCookiesFilePath();
+    if (cookiesPath) ytdlpInfoOptions.cookies = cookiesPath;
+
+    let ytInfo;
     try {
-        await runSpotDlCommand(runner, [spotifyUrl, '--output', outputTemplate, '--format', 'mp3']);
-    } catch (firstError) {
-        log('spotDL first command failed, trying fallback syntax...');
-        try {
-            await runSpotDlCommand(runner, ['download', spotifyUrl, '--output', outputTemplate, '--format', 'mp3']);
-        } catch (secondError) {
-            throw new Error(`spotDL failed: ${secondError.message || firstError.message}`);
+        ytInfo = await ytDlpExec(searchUrl, ytdlpInfoOptions);
+        // ytsearch returns a playlist-like object; actual video is in entries[0]
+        const videoInfo = ytInfo.entries?.[0] ?? ytInfo;
+        log(`Found: "${videoInfo.title}" by ${videoInfo.uploader || videoInfo.channel || '?'}`);
+
+        // Download the found video
+        const videoUrl = videoInfo.webpage_url || `https://www.youtube.com/watch?v=${videoInfo.id}`;
+        const { audioPath, audioExt } = await downloadAudioWithYtDlp(videoUrl, stem);
+
+        // Cover: prefer Spotify's hi-res album art over YouTube thumbnail
+        const jpgPath = path.join(COVERS_DIR, `${stem}.jpg`);
+        let hasCover = false;
+
+        if (entry.coverUrl) {
+            try {
+                await downloadThumbnailToJpg(entry.coverUrl, jpgPath);
+                hasCover = true;
+            } catch {
+                // fall through to YouTube thumbnail
+            }
         }
+
+        if (!hasCover) {
+            const thumbs = videoInfo.thumbnails || [];
+            const thumbUrl = thumbs.at(-1)?.url || thumbs[0]?.url || '';
+            if (thumbUrl) {
+                try {
+                    await downloadThumbnailToJpg(thumbUrl, jpgPath);
+                    hasCover = true;
+                } catch { /* no cover */ }
+            }
+        }
+
+        return { audioPath, audioExt, jpgPath, hasCover };
+    } catch (e) {
+        throw new Error(`YouTube search/download failed for "${query}": ${e.message}`);
     }
-
-    const afterFiles = fs.readdirSync(SONGS_DIR)
-        .filter((f) => AUDIO_EXTS.includes(path.extname(f).toLowerCase()));
-
-    const addedFiles = afterFiles.filter((f) => !beforeFiles.has(f));
-    if (!addedFiles.length) {
-        throw new Error('spotDL completed but no new audio files were created.');
-    }
-
-    return addedFiles.map((filename) => {
-        const ext = path.extname(filename);
-        const stem = filename.slice(0, filename.length - ext.length);
-        const meta = parseStemToMeta(stem);
-
-        return {
-            title: meta.title,
-            artist: meta.artist,
-            source: 'spotify',
-            localAudioPath: path.join(SONGS_DIR, filename),
-            audioExt: ext.replace('.', '') || 'mp3',
-        };
-    });
 }
+
+const AUDIO_EXTS = ['.mp3', '.webm', '.ogg', '.flac', '.m4a', '.opus', '.wav', '.aac'];
 
 async function streamToFile(sourceStream, filePath) {
     await fs.ensureDir(path.dirname(filePath));
@@ -753,18 +787,34 @@ async function downloadEntry(url, stem) {
     return { info, audioPath, audioExt, jpgPath, hasCover };
 }
 
-// ─── Get flat playlist info ───────────────────────────────────────────────────
+// ─── Resolve import source ────────────────────────────────────────────────────
 async function getPlaylistEntries(playlistUrl) {
     const spotifyTrackId = parseSpotifyTrackId(playlistUrl);
+    const spotifyAlbumId = parseSpotifyAlbumId(playlistUrl);
     const spotifyPlaylistId = parseSpotifyPlaylistId(playlistUrl);
-    if (spotifyTrackId || spotifyPlaylistId) {
-        log('Spotify link detected. Downloading with spotDL…');
-        const spotifyUrl = spotifyTrackId
-            ? buildSpotifyTrackUrl(spotifyTrackId)
-            : `https://open.spotify.com/playlist/${spotifyPlaylistId}`;
-        const entries = await runSpotDlDownload(spotifyUrl);
-        log(`spotDL downloaded ${entries.length} track(s).`);
-        return { entries, playlistAlbum: '' };
+
+    if (spotifyTrackId || spotifyAlbumId || spotifyPlaylistId) {
+        const hasCredentials = !!(process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET);
+        if (!hasCredentials) {
+            warn('SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET not set in .env.import.');
+            warn('Spotify metadata will be parsed from the URL only. For full metadata add credentials.');
+            warn('Get free credentials at https://developer.spotify.com/dashboard');
+        }
+
+        if (spotifyTrackId) {
+            if (hasCredentials) return getSpotifyTrackEntries(spotifyTrackId);
+            // No credentials — build a minimal entry from the URL itself;
+            // the title/artist will be resolved after YouTube search
+            return { entries: [{ title: '', artist: '', album: '', coverUrl: '', source: 'spotify', isSpotify: true, spotifyTrackId }], playlistAlbum: '' };
+        }
+        if (spotifyAlbumId) {
+            if (hasCredentials) return getSpotifyAlbumEntries(spotifyAlbumId);
+            throw new Error('Spotify album import requires SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET in .env.import');
+        }
+        if (spotifyPlaylistId) {
+            if (hasCredentials) return getSpotifyPlaylistEntries(spotifyPlaylistId);
+            throw new Error('Spotify playlist import requires SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET in .env.import');
+        }
     }
 
     log('Fetching playlist info (this may take a moment)…');
@@ -844,7 +894,9 @@ async function main() {
         console.log(`\n─── [${i + 1}/${entries.length}] ${rawTitle} ───`);
 
         // ── Step 1: determine meta from flat info ──────────────────────────
-        const { title, artist } = extractMeta(entry);
+        const { title, artist } = entry.isSpotify
+            ? { title: entry.title || `Track ${i + 1}`, artist: entry.artist || 'Unknown Artist' }
+            : extractMeta(entry);
         log(`Title:  ${title}`);
         log(`Artist: ${artist}`);
 
@@ -867,16 +919,27 @@ async function main() {
             ? `${artistStem}---${titleStem}`
             : titleStem;
         let info = { video_details: entry };
-        let audioPath = entry.localAudioPath || '';
-        let audioExt = entry.audioExt || '';
+        let audioPath = '';
+        let audioExt = '';
         let jpgPath = '';
         let hasCover = false;
 
-        if (audioPath) {
-            log(`Using spotDL file: ${path.basename(audioPath)}`);
-            const inferredExt = path.extname(audioPath).replace('.', '');
-            if (!audioExt && inferredExt) audioExt = inferredExt;
+        if (entry.isSpotify) {
+            // ── Spotify path: search YouTube for this track ────────────────
+            log(`Searching & downloading: ${title}`);
+            try {
+                const result = await searchAndDownloadSpotify(entry, stem);
+                audioPath = result.audioPath;
+                audioExt = result.audioExt;
+                jpgPath = result.jpgPath;
+                hasCover = result.hasCover;
+            } catch (e) {
+                err(`Download failed: ${e.message}`);
+                summary.failed++;
+                continue;
+            }
         } else {
+            // ── YouTube path ───────────────────────────────────────────────
             log(`Downloading: ${title}`);
             let downloadResult;
             try {
@@ -886,7 +949,6 @@ async function main() {
                 summary.failed++;
                 continue;
             }
-
             info = downloadResult.info;
             audioPath = downloadResult.audioPath;
             audioExt = downloadResult.audioExt;
@@ -900,7 +962,9 @@ async function main() {
             continue;
         }
 
-        const refreshedMeta = extractMeta(info.video_details || entry);
+        const refreshedMeta = entry.isSpotify
+            ? { title: entry.title || title, artist: entry.artist || artist }
+            : extractMeta(info.video_details || entry);
         if (refreshedMeta.title && refreshedMeta.title !== title) {
             log(`Resolved title: ${refreshedMeta.title}`);
         }
@@ -908,7 +972,9 @@ async function main() {
             log(`Resolved artist: ${refreshedMeta.artist}`);
         }
 
-        const resolvedAlbum = extractAlbumName(info, extractAlbumName(entry, playlistAlbum)) || playlistAlbum || '';
+        const resolvedAlbum = entry.isSpotify
+            ? (entry.album || playlistAlbum || '')
+            : (extractAlbumName(info, extractAlbumName(entry, playlistAlbum)) || playlistAlbum || '');
         if (resolvedAlbum) {
             log(`Album:  ${resolvedAlbum}`);
         }
