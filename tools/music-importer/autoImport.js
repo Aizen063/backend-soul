@@ -571,8 +571,7 @@ async function downloadAudioWithYtDlp(url, stem) {
         noPlaylist: true,
         format: 'bestaudio/best',
         output: outputTemplate,
-        quiet: false,        // show output so errors are visible
-        noWarnings: false,
+        jsRuntimes: 'node',
     };
 
     const cookiesPath = await getYtDlpCookiesFilePath();
@@ -639,6 +638,7 @@ async function getVideoInfoWithYtDlp(url) {
         skipDownload: true,
         noWarnings: true,
         quiet: true,
+        jsRuntimes: 'node',
     };
 
     const cookiesPath = await getYtDlpCookiesFilePath();
