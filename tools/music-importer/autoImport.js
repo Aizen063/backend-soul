@@ -571,8 +571,8 @@ async function downloadAudioWithYtDlp(url, stem) {
         noPlaylist: true,
         format: 'bestaudio/best',
         output: outputTemplate,
-        quiet: true,
-        noWarnings: true,
+        quiet: false,        // show output so errors are visible
+        noWarnings: false,
     };
 
     const cookiesPath = await getYtDlpCookiesFilePath();
@@ -580,12 +580,46 @@ async function downloadAudioWithYtDlp(url, stem) {
         ytdlpOptions.cookies = cookiesPath;
     }
 
-    await ytDlpExec(url, ytdlpOptions);
+    try {
+        await ytDlpExec(url, ytdlpOptions);
+    } catch (ytdlpError) {
+        // yt-dlp sometimes exits non-zero even when the file was written.
+        // Fall through to the file-scan check before re-throwing.
+        warn(`yt-dlp exited with error: ${ytdlpError.message?.slice(0, 300)}`);
+    }
 
     const afterFiles = await fs.readdir(SONGS_DIR);
-    const added = afterFiles
+
+    // First: prefer files that match the expected stem (exact output template match)
+    const IMAGE_EXTS = /\.(jpg|jpeg|png|webp|gif)$/i;
+    let added = afterFiles
         .filter((file) => !beforeFiles.has(file) && file.startsWith(`${stem}.`))
-        .filter((file) => !/\.(jpg|jpeg|png|webp)$/i.test(file));
+        .filter((file) => !IMAGE_EXTS.test(file));
+
+    // Fallback: if stem didn't match (yt-dlp used its own title-based filename),
+    // pick any new audio file that appeared in the directory.
+    if (!added.length) {
+        added = afterFiles
+            .filter((file) => !beforeFiles.has(file))
+            .filter((file) => !IMAGE_EXTS.test(file))
+            .filter((file) => AUDIO_EXTS.some((ext) => file.toLowerCase().endsWith(ext)));
+
+        if (added.length) {
+            // Rename the file to match the expected stem so downstream code is consistent
+            const originalName = added[0];
+            const ext = path.extname(originalName);
+            const renamedName = `${stem}${ext}`;
+            try {
+                await fs.rename(
+                    path.join(SONGS_DIR, originalName),
+                    path.join(SONGS_DIR, renamedName),
+                );
+                added[0] = renamedName;
+            } catch {
+                // Rename failed — proceed with the original filename
+            }
+        }
+    }
 
     if (!added.length) {
         throw new Error('yt-dlp fallback completed but no audio file was created.');
@@ -622,6 +656,7 @@ async function downloadEntry(url, stem) {
     let info;
     let audioFormats = [];
 
+    // Fetch video metadata — if play-dl rejects the URL, fall back to yt-dlp for info too
     if (useYtdlpPrimary) {
         const ytdlpInfo = await getVideoInfoWithYtDlp(normalizedUrl);
         info = {
@@ -636,10 +671,33 @@ async function downloadEntry(url, stem) {
             format: [],
         };
     } else {
-        info = await play.video_info(normalizedUrl);
-        audioFormats = (info.format || [])
-            .filter((format) => typeof format.mimeType === 'string' && format.mimeType.startsWith('audio/') && format.url)
-            .sort((left, right) => (Number(right.bitrate || right.averageBitrate || 0) - Number(left.bitrate || left.averageBitrate || 0)));
+        try {
+            info = await play.video_info(normalizedUrl);
+            audioFormats = (info.format || [])
+                .filter((format) => typeof format.mimeType === 'string' && format.mimeType.startsWith('audio/') && format.url)
+                .sort((left, right) => (Number(right.bitrate || right.averageBitrate || 0) - Number(left.bitrate || left.averageBitrate || 0)));
+        } catch (infoError) {
+            // play-dl rejected the URL (e.g. "Invalid URL") — use yt-dlp for metadata too
+            warn(`play-dl video_info failed (${infoError.message}). Using yt-dlp for metadata and download.`);
+            try {
+                const ytdlpInfo = await getVideoInfoWithYtDlp(normalizedUrl);
+                info = {
+                    video_details: {
+                        title: ytdlpInfo.title,
+                        artist: ytdlpInfo.artist,
+                        creator: ytdlpInfo.creator,
+                        uploader: ytdlpInfo.uploader,
+                        channel: { name: ytdlpInfo.channel || ytdlpInfo.uploader || '' },
+                        thumbnails: (ytdlpInfo.thumbnails || []).map((thumb) => ({ url: thumb.url })),
+                    },
+                    format: [],
+                };
+            } catch {
+                // yt-dlp info also failed — set a minimal stub so download can still proceed
+                info = { video_details: { thumbnails: [] }, format: [] };
+            }
+            audioFormats = []; // force yt-dlp download path below
+        }
     }
 
     let audioExt;
@@ -779,7 +837,8 @@ async function main() {
 
     for (let i = 0; i < entries.length; i++) {
         const entry = entries[i];
-        const videoUrl = entry.url || entry.webpage_url || `https://www.youtube.com/watch?v=${entry.id}` || PLAYLIST_URL;
+        const rawVideoUrl = entry.url || entry.webpage_url || (entry.id ? `https://www.youtube.com/watch?v=${entry.id}` : '') || PLAYLIST_URL;
+        const videoUrl = normalizeVideoUrl(rawVideoUrl);
         const rawTitle = entry.title || `Track ${i + 1}`;
 
         console.log(`\n─── [${i + 1}/${entries.length}] ${rawTitle} ───`);
