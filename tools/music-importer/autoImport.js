@@ -20,6 +20,7 @@
 const path = require('path');
 const os = require('os');
 const fs = require('fs-extra');
+const { spawn, spawnSync } = require('child_process');
 const axios = require('axios');
 const FormData = require('form-data');
 const play = require('play-dl');
@@ -374,6 +375,180 @@ const toAbsoluteHttpUrl = (value) => {
     return null;
 };
 
+function parseSpotifyTrackId(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== 'string') return '';
+    const input = rawUrl.trim();
+
+    const uriMatch = input.match(/^spotify:track:([a-zA-Z0-9]+)$/i);
+    if (uriMatch) return uriMatch[1];
+
+    if (!input.startsWith('http://') && !input.startsWith('https://')) return '';
+
+    try {
+        const parsed = new URL(input);
+        if (!/spotify\.com$/i.test(parsed.hostname)) return '';
+        const trackMatch = parsed.pathname.match(/\/track\/([a-zA-Z0-9]+)/i);
+        return trackMatch ? trackMatch[1] : '';
+    } catch {
+        return '';
+    }
+}
+
+function parseSpotifyPlaylistId(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== 'string') return '';
+    const input = rawUrl.trim();
+
+    const uriMatch = input.match(/^spotify:playlist:([a-zA-Z0-9]+)$/i);
+    if (uriMatch) return uriMatch[1];
+
+    if (!input.startsWith('http://') && !input.startsWith('https://')) return '';
+
+    try {
+        const parsed = new URL(input);
+        if (!/spotify\.com$/i.test(parsed.hostname)) return '';
+        const listMatch = parsed.pathname.match(/\/playlist\/([a-zA-Z0-9]+)/i);
+        return listMatch ? listMatch[1] : '';
+    } catch {
+        return '';
+    }
+}
+
+function buildSpotifyTrackUrl(trackId) {
+    return `https://open.spotify.com/track/${trackId}`;
+}
+
+const AUDIO_EXTS = ['.mp3', '.webm', '.ogg', '.flac', '.m4a', '.opus', '.wav', '.aac'];
+
+function parseStemToMeta(stem) {
+    let title = '';
+    let artist = '';
+
+    if (stem.includes('---')) {
+        const parts = stem.split('---');
+        artist = parts[0].replace(/-/g, ' ').trim();
+        title = parts.slice(1).join(' ').replace(/-/g, ' ').trim();
+    } else {
+        const humanReadable = stem.replace(/-/g, ' ').replace(/\s{2,}/g, ' ').trim();
+        const sepMatch = humanReadable.match(/^(.+?)\s*[-–—|]\s+(.+)$/);
+        if (sepMatch) {
+            artist = sepMatch[1].trim();
+            title = sepMatch[2].trim();
+        } else {
+            title = humanReadable;
+        }
+    }
+
+    const cap = (s) => s.replace(/\b\w/g, (c) => c.toUpperCase());
+    return {
+        title: cap(title || stem),
+        artist: cap(artist || 'Unknown Artist'),
+    };
+}
+
+async function runSpotDlCommand(runner, args) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(runner.cmd, [...runner.prefix, ...args], {
+            cwd: process.cwd(),
+            env: process.env,
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+
+        let combined = '';
+        child.stdout.on('data', (chunk) => {
+            const text = chunk.toString();
+            process.stdout.write(text);
+            combined += text;
+        });
+        child.stderr.on('data', (chunk) => {
+            const text = chunk.toString();
+            process.stderr.write(text);
+            combined += text;
+        });
+
+        child.on('error', (error) => reject(error));
+        child.on('close', (code) => {
+            if (code === 0) return resolve(combined);
+            const tail = combined.slice(-1200);
+            if (/rate\/request limit|retry will occur after/i.test(tail)) {
+                return reject(new Error('Spotify rate limit reached while using spotDL. Try again later or set SPOTIPY_CLIENT_ID and SPOTIPY_CLIENT_SECRET for your own Spotify app credentials.'));
+            }
+            return reject(new Error(`spotDL exited with code ${code}. ${tail}`));
+        });
+    });
+}
+
+async function runSpotDlDownload(spotifyUrl) {
+    let runner = { cmd: 'spotdl', prefix: [] };
+    const versionCheck = spawnSync('spotdl', ['--version'], { encoding: 'utf8' });
+
+    if (versionCheck.error || versionCheck.status !== 0) {
+        const pythonCandidates = [
+            process.env.IMPORT_PYTHON_BIN,
+            'python',
+            'python3',
+            'py',
+        ].filter(Boolean);
+
+        let pythonRunner = null;
+        for (const pyCmd of pythonCandidates) {
+            const probeArgs = pyCmd === 'py'
+                ? ['-m', 'spotdl', '--version']
+                : ['-m', 'spotdl', '--version'];
+            const probe = spawnSync(pyCmd, probeArgs, { encoding: 'utf8' });
+            if (!probe.error && probe.status === 0) {
+                pythonRunner = { cmd: pyCmd, prefix: ['-m', 'spotdl'] };
+                break;
+            }
+        }
+
+        if (!pythonRunner) {
+            throw new Error('spotDL is not installed or not available in PATH. Install it with: pip install spotdl');
+        }
+
+        runner = pythonRunner;
+    }
+
+    const withRunner = (args) => [...runner.prefix, ...args];
+
+    const outputTemplate = path.join(SONGS_DIR, '{artist}---{title}.{output-ext}');
+    const beforeFiles = new Set(
+        fs.readdirSync(SONGS_DIR).filter((f) => AUDIO_EXTS.includes(path.extname(f).toLowerCase()))
+    );
+
+    try {
+        await runSpotDlCommand(runner, [spotifyUrl, '--output', outputTemplate, '--format', 'mp3']);
+    } catch (firstError) {
+        log('spotDL first command failed, trying fallback syntax...');
+        try {
+            await runSpotDlCommand(runner, ['download', spotifyUrl, '--output', outputTemplate, '--format', 'mp3']);
+        } catch (secondError) {
+            throw new Error(`spotDL failed: ${secondError.message || firstError.message}`);
+        }
+    }
+
+    const afterFiles = fs.readdirSync(SONGS_DIR)
+        .filter((f) => AUDIO_EXTS.includes(path.extname(f).toLowerCase()));
+
+    const addedFiles = afterFiles.filter((f) => !beforeFiles.has(f));
+    if (!addedFiles.length) {
+        throw new Error('spotDL completed but no new audio files were created.');
+    }
+
+    return addedFiles.map((filename) => {
+        const ext = path.extname(filename);
+        const stem = filename.slice(0, filename.length - ext.length);
+        const meta = parseStemToMeta(stem);
+
+        return {
+            title: meta.title,
+            artist: meta.artist,
+            source: 'spotify',
+            localAudioPath: path.join(SONGS_DIR, filename),
+            audioExt: ext.replace('.', '') || 'mp3',
+        };
+    });
+}
+
 async function streamToFile(sourceStream, filePath) {
     await fs.ensureDir(path.dirname(filePath));
     await new Promise((resolve, reject) => {
@@ -519,6 +694,18 @@ async function downloadEntry(url, stem) {
 
 // ─── Get flat playlist info ───────────────────────────────────────────────────
 async function getPlaylistEntries(playlistUrl) {
+    const spotifyTrackId = parseSpotifyTrackId(playlistUrl);
+    const spotifyPlaylistId = parseSpotifyPlaylistId(playlistUrl);
+    if (spotifyTrackId || spotifyPlaylistId) {
+        log('Spotify link detected. Downloading with spotDL…');
+        const spotifyUrl = spotifyTrackId
+            ? buildSpotifyTrackUrl(spotifyTrackId)
+            : `https://open.spotify.com/playlist/${spotifyPlaylistId}`;
+        const entries = await runSpotDlDownload(spotifyUrl);
+        log(`spotDL downloaded ${entries.length} track(s).`);
+        return { entries, playlistAlbum: '' };
+    }
+
     log('Fetching playlist info (this may take a moment)…');
     try {
         const normalizedPlaylistUrl = normalizePlaylistUrl(playlistUrl);
@@ -581,7 +768,7 @@ async function main() {
         entries = playlistResult.entries;
         playlistAlbum = playlistResult.playlistAlbum || '';
     } catch (e) {
-        err(`Failed to fetch playlist: ${e.message}`);
+        err(`Failed to resolve import source: ${e.message}`);
         process.exit(1);
     }
 
@@ -617,17 +804,33 @@ async function main() {
         const stem = (artist && artist !== 'Unknown Artist')
             ? `${artistStem}---${titleStem}`
             : titleStem;
-        log(`Downloading: ${title}`);
-        let downloadResult;
-        try {
-            downloadResult = await downloadEntry(videoUrl, stem);
-        } catch (e) {
-            err(`Download failed: ${e.message}`);
-            summary.failed++;
-            continue;
-        }
+        let info = { video_details: entry };
+        let audioPath = entry.localAudioPath || '';
+        let audioExt = entry.audioExt || '';
+        let jpgPath = '';
+        let hasCover = false;
 
-        const { info, audioPath, audioExt, jpgPath, hasCover } = downloadResult;
+        if (audioPath) {
+            log(`Using spotDL file: ${path.basename(audioPath)}`);
+            const inferredExt = path.extname(audioPath).replace('.', '');
+            if (!audioExt && inferredExt) audioExt = inferredExt;
+        } else {
+            log(`Downloading: ${title}`);
+            let downloadResult;
+            try {
+                downloadResult = await downloadEntry(videoUrl, stem);
+            } catch (e) {
+                err(`Download failed: ${e.message}`);
+                summary.failed++;
+                continue;
+            }
+
+            info = downloadResult.info;
+            audioPath = downloadResult.audioPath;
+            audioExt = downloadResult.audioExt;
+            jpgPath = downloadResult.jpgPath;
+            hasCover = downloadResult.hasCover;
+        }
 
         if (!fs.existsSync(audioPath)) {
             err(`Audio not found at expected path: ${audioPath}`);
